@@ -1,0 +1,2655 @@
+import pygame
+import os
+import random
+import math
+import json
+import xml.etree.ElementTree as ET
+
+os.environ['SDL_VIDEO_CENTERED'] = '1'
+pygame.mixer.pre_init(22050, -16, 1, 512)
+pygame.init()
+
+# =========================
+# SCREEN
+# =========================
+WIDTH, HEIGHT = 1920, 1080
+WORLD_WIDTH, WORLD_HEIGHT = 3840, 2160
+screen = pygame.display.set_mode((WIDTH, HEIGHT), pygame.FULLSCREEN)
+pygame.display.set_caption("Wave Survival Boss Fight")
+
+clock = pygame.time.Clock()
+
+# =========================
+# ASSETS
+# =========================
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+ASSETS_DIR = os.path.join(BASE_DIR, "assets")
+SAVE_PATH = os.path.join(BASE_DIR, "save.json")
+
+def resolve_tmx_source_path(base_path, source):
+    source_path = os.path.join(os.path.dirname(base_path), source)
+    return os.path.normpath(source_path)
+
+def load_tmx_map(path, size=None):
+    tree = ET.parse(path)
+    root = tree.getroot()
+    tilewidth = int(root.get('tilewidth', 32))
+    tileheight = int(root.get('tileheight', 32))
+
+    gid_tiles = {}
+    for tileset in root.findall('tileset'):
+        firstgid = int(tileset.get('firstgid', 1))
+        ts_root = tileset
+        ts_path = path
+        source = tileset.get('source')
+        if source:
+            ts_path = resolve_tmx_source_path(path, source)
+            ts_tree = ET.parse(ts_path)
+            ts_root = ts_tree.getroot()
+
+        image = ts_root.find('image')
+        if image is None:
+            continue
+
+        img_source = image.get('source')
+        img_path = resolve_tmx_source_path(ts_path, img_source)
+        tileset_img = pygame.image.load(img_path).convert_alpha()
+
+        tw = int(ts_root.get('tilewidth', tilewidth))
+        th = int(ts_root.get('tileheight', tileheight))
+        columns = int(ts_root.get('columns', 0))
+        count = int(ts_root.get('tilecount', 0))
+        margin = int(ts_root.get('margin', 0))
+        spacing = int(ts_root.get('spacing', 0))
+        if columns == 0 and tw > 0:
+            columns = tileset_img.get_width() // tw
+        if columns == 0:
+            columns = 1
+
+        for local_id in range(count):
+            gid = firstgid + local_id
+            tile_x = local_id % columns
+            tile_y = local_id // columns
+            rect = pygame.Rect(
+                margin + tile_x * (tw + spacing),
+                margin + tile_y * (th + spacing),
+                tw,
+                th,
+            )
+            gid_tiles[gid] = tileset_img.subsurface(rect).copy()
+
+    layer_chunks = []
+    min_px = min_py = 0.0
+    max_px = max_py = 0.0
+    for layer in root.findall('layer'):
+        data = layer.find('data')
+        if data is None:
+            continue
+
+        offset_x = float(layer.get('offsetx', 0))
+        offset_y = float(layer.get('offsety', 0))
+        chunk_nodes = data.findall('chunk')
+        if chunk_nodes:
+            for chunk in chunk_nodes:
+                x = int(chunk.get('x', 0))
+                y = int(chunk.get('y', 0))
+                width = int(chunk.get('width', 0))
+                height = int(chunk.get('height', 0))
+                gids = [int(v) for v in chunk.text.strip().replace('\n', '').split(',') if v.strip()]
+                layer_chunks.append((x, y, width, height, gids, offset_x, offset_y))
+                min_px = min(min_px, x * tilewidth + offset_x)
+                min_py = min(min_py, y * tileheight + offset_y)
+                max_px = max(max_px, (x + width) * tilewidth + offset_x)
+                max_py = max(max_py, (y + height) * tileheight + offset_y)
+        else:
+            raw = data.text or ''
+            gids = [int(v) for v in raw.strip().replace('\n', '').split(',') if v.strip()]
+            width = int(data.get('width', 0))
+            height = int(data.get('height', 0))
+            if width and height:
+                layer_chunks.append((0, 0, width, height, gids, offset_x, offset_y))
+                min_px = min(min_px, offset_x)
+                min_py = min(min_py, offset_y)
+                max_px = max(max_px, width * tilewidth + offset_x)
+                max_py = max(max_py, height * tileheight + offset_y)
+
+    if not layer_chunks:
+        raise ValueError(f'No visible tile layers found in TMX map: {path}')
+
+    surface_width = int(math.ceil(max_px - min_px))
+    surface_height = int(math.ceil(max_py - min_py))
+    surface = pygame.Surface((surface_width, surface_height), pygame.SRCALPHA)
+
+    for x, y, width, height, gids, offset_x, offset_y in layer_chunks:
+        for index, gid in enumerate(gids):
+            if gid == 0:
+                continue
+            tile = gid_tiles.get(gid)
+            if tile is None:
+                continue
+            local_x = index % width
+            local_y = index // width
+            px = int(round((x * tilewidth + offset_x) - min_px + local_x * tilewidth))
+            py = int(round((y * tileheight + offset_y) - min_py + local_y * tileheight))
+            surface.blit(tile, (px, py))
+
+    if size:
+        surface = pygame.transform.scale(surface, size)
+    return surface
+
+
+def load(name, size=None):
+    path = os.path.join(ASSETS_DIR, name)
+    if name.lower().endswith('.tmx'):
+        return load_tmx_map(path, size)
+    img = pygame.image.load(path).convert_alpha()
+    if size:
+        img = pygame.transform.scale(img, size)
+    return img
+
+def load_optional(name, size=None):
+    path = os.path.join(ASSETS_DIR, name)
+    if not os.path.exists(path):
+        return None
+    return load(name, size)
+
+def load_optional_cropped(name, max_size):
+    path = os.path.join(ASSETS_DIR, name)
+    if not os.path.exists(path):
+        return None
+
+    img = pygame.image.load(path).convert_alpha()
+    crop_rect = img.get_bounding_rect()
+    if crop_rect.width > 0 and crop_rect.height > 0:
+        img = img.subsurface(crop_rect).copy()
+
+    scale = min(max_size[0] / img.get_width(), max_size[1] / img.get_height())
+    size = (max(1, int(img.get_width() * scale)), max(1, int(img.get_height() * scale)))
+    return pygame.transform.scale(img, size)
+
+player_img = load("player.png", (60, 60))
+enemy_img = load("enemy.png", (50, 50))
+enemy_p_img = load("enemy_p.png", (70, 70))
+bullet_img = load("bullet.png", (15, 15))
+boss_img = load("boss.png", (220, 220))
+base_map_img = load("map.tmx")
+WORLD_WIDTH, WORLD_HEIGHT = base_map_img.get_width(), base_map_img.get_height()
+menu_img = load("menu.png", (WIDTH, HEIGHT))
+
+PLAYER_PARTS = {
+    "head": load_optional(os.path.join("player_parts", "head_hood.png"), (42, 36)),
+    "body": load_optional(os.path.join("player_parts", "torso.png"), (34, 38)),
+    "arm_left": load_optional(os.path.join("player_parts", "left_arm.png"), (14, 36)),
+    "arm_right": load_optional(os.path.join("player_parts", "right_arm.png"), (14, 36)),
+    "leg_left": load_optional(os.path.join("player_parts", "left_leg.png"), (14, 30)),
+    "leg_right": load_optional(os.path.join("player_parts", "right_leg.png"), (14, 30)),
+}
+
+PLAYER_PARTS_READY = all(part is not None for part in PLAYER_PARTS.values())
+
+def create_weapon_image(kind, size):
+    surface = pygame.Surface(size, pygame.SRCALPHA)
+    width, height = size
+    grip_color = (62, 42, 32)
+    metal_dark = (38, 45, 48)
+    metal = (82, 95, 98)
+    accent = (124, 82, 54)
+
+    if kind == "pistol":
+        pygame.draw.rect(surface, metal, (3, 4, width - 10, 6))
+        pygame.draw.rect(surface, metal_dark, (width - 9, 5, 8, 3))
+        pygame.draw.rect(surface, grip_color, (8, 9, 6, height - 10))
+        pygame.draw.rect(surface, (18, 18, 18), (5, 9, 8, 3))
+    elif kind == "shotgun":
+        pygame.draw.rect(surface, accent, (4, 7, width - 8, 5))
+        pygame.draw.rect(surface, metal_dark, (12, 3, width - 14, 4))
+        pygame.draw.rect(surface, grip_color, (5, 10, 9, height - 11))
+    elif kind == "rifle":
+        pygame.draw.rect(surface, metal_dark, (5, 6, width - 7, 5))
+        pygame.draw.rect(surface, accent, (12, 11, 15, 4))
+        pygame.draw.rect(surface, grip_color, (7, 11, 8, height - 10))
+        pygame.draw.rect(surface, metal, (width - 8, 4, 6, 3))
+    elif kind == "sniper":
+        pygame.draw.rect(surface, metal_dark, (4, 7, width - 4, 4))
+        pygame.draw.rect(surface, accent, (8, 11, 20, 4))
+        pygame.draw.rect(surface, metal, (18, 3, 12, 3))
+        pygame.draw.rect(surface, grip_color, (8, 13, 7, height - 14))
+    else:
+        pygame.draw.rect(surface, (54, 86, 66), (7, 5, width - 14, 9), border_radius=4)
+        pygame.draw.rect(surface, metal_dark, (width - 14, 7, 13, 5))
+        pygame.draw.rect(surface, grip_color, (8, 13, 8, height - 13))
+
+    return surface
+
+
+WEAPON_IMAGES = {
+    "pistol": load_optional_cropped(os.path.join("weapons", "pistol.png"), (24, 18)) or create_weapon_image("pistol", (24, 12)),
+    "shotgun": load_optional_cropped(os.path.join("weapons", "shotgun.png"), (48, 18)) or create_weapon_image("shotgun", (42, 16)),
+    "rifle": load_optional_cropped(os.path.join("weapons", "ak47.png"), (50, 20)) or create_weapon_image("rifle", (44, 16)),
+    "sniper": load_optional_cropped(os.path.join("weapons", "sniper.png"), (54, 18)) or create_weapon_image("sniper", (52, 16)),
+    "rpg": load_optional_cropped(os.path.join("weapons", "rpg.png"), (54, 18)) or create_weapon_image("rpg", (52, 20)),
+}
+
+WEAPONS = {
+    "pistol": {
+        "name": "Pistol",
+        "cost": 0,
+        "magazine": 30,
+        "ammo_cost": 30,
+        "sprite": load("player_P.png", (60, 60)),
+        "delay": 230,
+        "reload_time": 900,
+        "speed": 13,
+        "damage": 1,
+        "pellets": 1,
+        "spread": 0,
+        "blast_radius": 0,
+    },
+    "shotgun": {
+        "name": "Shotgun",
+        "cost": 200,
+        "magazine": 8,
+        "ammo_cost": 45,
+        "sprite": load("Player_SH.png", (60, 60)),
+        "delay": 520,
+        "reload_time": 1250,
+        "speed": 12,
+        "damage": 1,
+        "pellets": 5,
+        "spread": 0.22,
+        "blast_radius": 0,
+    },
+    "rifle": {
+        "name": "Rifle",
+        "cost": 400,
+        "magazine": 45,
+        "ammo_cost": 80,
+        "sprite": load("Player_AK.png", (60, 60)),
+        "delay": 90,
+        "reload_time": 1550,
+        "speed": 16,
+        "damage": 1,
+        "pellets": 1,
+        "spread": 0,
+        "blast_radius": 0,
+    },
+    "sniper": {
+        "name": "Sniper Rifle",
+        "cost": 600,
+        "magazine": 10,
+        "ammo_cost": 70,
+        "sprite": load("Player_SP.png", (60, 60)),
+        "delay": 650,
+        "reload_time": 1800,
+        "speed": 24,
+        "damage": 5,
+        "pellets": 1,
+        "spread": 0,
+        "blast_radius": 0,
+    },
+    "rpg": {
+        "name": "RPG",
+        "cost": 800,
+        "magazine": 5,
+        "ammo_cost": 120,
+        "sprite": load("Player_RPG.png", (60, 60)),
+        "delay": 900,
+        "reload_time": 2300,
+        "speed": 9,
+        "damage": 8,
+        "pellets": 1,
+        "spread": 0,
+        "blast_radius": 90,
+    },
+}
+
+weapon_order = ["pistol", "shotgun", "rifle", "sniper", "rpg"]
+unlocked_weapons = {"pistol"}
+current_weapon = "pistol"
+weapon_upgrades = {
+    weapon_key: {"damage": 0, "magazine": 0, "reload": 0}
+    for weapon_key in weapon_order
+}
+SETTINGS = {
+    "music_volume": AMBIENT_VOLUME if "AMBIENT_VOLUME" in globals() else 0.35,
+    "sfx_volume": 0.8,
+    "fullscreen": True,
+    "language": "en",
+}
+LANGUAGES = {
+    "en": "English",
+    "ru": "Русский",
+    "uk": "Українська",
+}
+TEXT = {
+    "en": {
+        "start_game": "Start Game",
+        "weapon_shop": "Weapon Shop",
+        "your_points": "Your Points",
+        "welcome_safe_house": "Welcome to your safe house",
+        "buy_ammo": "Buy Ammo",
+        "exit_house": "Exit House",
+        "upgrade_damage": "Upgrade Damage",
+        "upgrade_magazine": "Upgrade Magazine",
+        "upgrade_reload": "Upgrade Reload",
+        "rest_heal": "Rest & Heal",
+        "upgrade_medkit_capacity": "Upgrade Medkit Capacity",
+        "full": "Full",
+        "coins": "coins",
+        "plus_mag": "+1 magazine",
+        "weapon_pistol": "Pistol",
+        "weapon_shotgun": "Shotgun",
+        "weapon_rifle": "Rifle",
+        "weapon_sniper": "Sniper Rifle",
+        "weapon_rpg": "RPG",
+        "selected": "Selected",
+        "bought_and_selected": "Bought and selected",
+        "need": "Need",
+        "points": "points",
+        "back": "Back",
+        "buy_or_select_weapon": "Buy or select a weapon",
+        "owned": "Owned",
+        "settings": "Settings",
+        "quit": "Quit",
+        "last_score": "Last Score",
+        "record": "Record",
+        "music_volume": "Music Volume",
+        "sfx_volume": "SFX Volume",
+        "fullscreen": "Fullscreen",
+        "language": "Language",
+        "back": "Back",
+        "on": "On",
+        "off": "Off",
+        "settings_hint": "Use left/right or click to change",
+        "resume_game": "Resume Game",
+        "exit_to_menu": "Exit to Main Menu",
+        "game_over": "GAME OVER",
+        "final_score": "Final Score",
+        "victory": "VICTORY",
+        "press_enter": "Press Enter",
+    },
+    "ru": {
+        "start_game": "Начать игру",
+        "weapon_shop": "Магазин оружия",
+        "your_points": "Ваши очки",
+        "welcome_safe_house": "Добро пожаловать в вашу безопасную хижину",
+        "buy_ammo": "Купить патроны",
+        "exit_house": "Выйти из дома",
+        "upgrade_damage": "Улучшить урон",
+        "upgrade_magazine": "Улучшить обойму",
+        "upgrade_reload": "Улучшить перезарядку",
+        "rest_heal": "Отдохнуть и исцелиться",
+        "upgrade_medkit_capacity": "Увеличить ёмкость аптечек",
+        "full": "Полный",
+        "coins": "монет",
+        "plus_mag": "+1 обойма",
+        "weapon_pistol": "Пистолет",
+        "weapon_shotgun": "Дробовик",
+        "weapon_rifle": "Автомат",
+        "weapon_sniper": "Снайперская винтовка",
+        "weapon_rpg": "РПГ",
+        "selected": "Выбрано",
+        "bought_and_selected": "Куплено и выбрано",
+        "need": "Нужно",
+        "points": "очков",
+        "back": "Назад",
+        "buy_or_select_weapon": "Купить или выбрать оружие",
+        "owned": "В принадлежности",
+        "settings": "Настройки",
+        "quit": "Выйти",
+        "last_score": "Последний счёт",
+        "record": "Рекорд",
+        "music_volume": "Музыка",
+        "sfx_volume": "Громкость звуков",
+        "fullscreen": "Полный экран",
+        "language": "Язык",
+        "back": "Назад",
+        "on": "Вкл",
+        "off": "Выкл",
+        "settings_hint": "Влево/вправо или клик, чтобы изменить",
+        "resume_game": "Продолжить",
+        "exit_to_menu": "Выйти в меню",
+        "game_over": "ИГРА ОКОНЧЕНА",
+        "final_score": "Итоговый счёт",
+        "victory": "ПОБЕДА",
+        "press_enter": "Нажми Enter",
+    },
+    "uk": {
+        "start_game": "Почати гру",
+        "weapon_shop": "Магазин зброї",
+        "your_points": "Ваші очки",
+        "welcome_safe_house": "Ласкаво просимо до вашої безпечної домівки",
+        "buy_ammo": "Придбати патрони",
+        "exit_house": "Покинути домівку",
+        "upgrade_damage": "Покращити урон",
+        "upgrade_magazine": "Покращити обійму",
+        "upgrade_reload": "Покращити перезарядку",
+        "rest_heal": "Відпочити й вилікуватись",
+        "upgrade_medkit_capacity": "Збільшити місткість аптечок",
+        "full": "Повний",
+        "coins": "монет",
+        "plus_mag": "+1 обійма",
+        "weapon_pistol": "Пістолет",
+        "weapon_shotgun": "Дробовик",
+        "weapon_rifle": "Автомат",
+        "weapon_sniper": "Снайперська гвинтівка",
+        "weapon_rpg": "РПГ",
+        "selected": "Вибрано",
+        "bought_and_selected": "Куплено й вибрано",
+        "need": "Потрібно",
+        "points": "очок",
+        "back": "Назад",
+        "buy_or_select_weapon": "Купити або вибрати зброю",
+        "owned": "У володінні",
+        "settings": "Налаштування",
+        "quit": "Вийти",
+        "last_score": "Останній рахунок",
+        "record": "Рекорд",
+        "music_volume": "Музика",
+        "sfx_volume": "Гучність звуків",
+        "fullscreen": "Повний екран",
+        "language": "Мова",
+        "back": "Назад",
+        "on": "Увімк",
+        "off": "Вимк",
+        "settings_hint": "Вліво/вправо або клік, щоб змінити",
+        "resume_game": "Продовжити",
+        "exit_to_menu": "Вийти в меню",
+        "game_over": "ГРУ ЗАВЕРШЕНО",
+        "final_score": "Підсумковий рахунок",
+        "victory": "ПЕРЕМОГА",
+        "press_enter": "Натисни Enter",
+    },
+}
+
+PLAYER_MAX_HP = 100
+ZOMBIE_BASE_HP = 3
+ZOMBIE_HP_PER_LEVEL = 1
+ZOMBIE_TOUCH_DAMAGE = 15
+BOSS_BULLET_DAMAGE = 20
+BOSS_TOUCH_DAMAGE = 35
+MINI_BOSS_BASE_HP = 14
+MINI_BOSS_HP_PER_LEVEL = 4
+MINI_BOSS_TOUCH_DAMAGE = 20
+MINI_BOSS_BULLET_DAMAGE = 10
+MINI_BOSS_SHOOT_DELAY = 900
+MINI_BOSS_SIGHT_RANGE = 850
+BOSS_SIGHT_RANGE = 1100
+PLAYER_HIT_COOLDOWN = 700
+ENEMY_SPEED_WAVE_MULTIPLIER = 1.04
+ENEMY_SPEED_LEVEL_MULTIPLIER = 1.08
+MEDKIT_HEAL_AMOUNT = 30
+MAX_MEDKITS = 3
+MAX_MEDKIT_CAPACITY = 6
+MEDKIT_DROP_CHANCE = 0.4
+BASE_SPARE_MAGAZINES = 2
+MAX_SPARE_MAGAZINES = 4
+MAX_WEAPON_UPGRADE_LEVEL = 3
+WAVES_PER_MAP = 10
+LEVEL_SKIP_CHEATS = ("SKIPLEVEL", "NEXTLEVEL")
+CHEAT_BUFFER_LIMIT = max(len(code) for code in LEVEL_SKIP_CHEATS)
+UPGRADE_COSTS = {
+    "damage": [120, 240, 420],
+    "magazine": [90, 180, 300],
+    "reload": [100, 200, 340],
+}
+ZOMBIE_COIN_REWARD = 10
+MINI_BOSS_COIN_REWARD = 45
+BOSS_COIN_REWARD = 180
+WAVE_CLEAR_BASE_COINS = 60
+WAVE_CLEAR_COINS_PER_WAVE = 20
+ENEMY_TYPES = {
+    "walker": {
+        "name": "Walker",
+        "wave": 1,
+        "weight": 70,
+        "size": 50,
+        "hp_mult": 1.0,
+        "speed_mult": 1.0,
+        "damage": ZOMBIE_TOUCH_DAMAGE,
+        "reward": ZOMBIE_COIN_REWARD,
+        "tint": (255, 255, 255),
+        "bar": (80, 220, 80),
+    },
+    "runner": {
+        "name": "Runner",
+        "wave": 2,
+        "weight": 28,
+        "size": 44,
+        "hp_mult": 0.7,
+        "speed_mult": 1.45,
+        "damage": 10,
+        "reward": 12,
+        "tint": (255, 210, 160),
+        "bar": (255, 190, 70),
+    },
+    "brute": {
+        "name": "Brute",
+        "wave": 3,
+        "weight": 18,
+        "size": 64,
+        "hp_mult": 2.4,
+        "speed_mult": 0.65,
+        "damage": 25,
+        "reward": 25,
+        "tint": (210, 170, 255),
+        "bar": (180, 100, 255),
+    },
+    "toxic": {
+        "name": "Toxic",
+        "wave": 4,
+        "weight": 16,
+        "size": 50,
+        "hp_mult": 1.25,
+        "speed_mult": 0.9,
+        "damage": 18,
+        "reward": 20,
+        "tint": (160, 255, 150),
+        "bar": (130, 255, 100),
+    },
+    "spitter": {
+        "name": "Spitter",
+        "wave": 5,
+        "weight": 14,
+        "size": 50,
+        "hp_mult": 1.15,
+        "speed_mult": 0.75,
+        "damage": 12,
+        "reward": 22,
+        "tint": (150, 220, 255),
+        "bar": (90, 200, 255),
+        "shoot_delay": 1500,
+        "range": 650,
+    },
+}
+AMBIENT_VOLUME = 0.35
+SETTINGS["music_volume"] = AMBIENT_VOLUME
+HOUSE_RECT = pygame.Rect(1165, 1046, 229, 343)
+BREAK_DURATION = 12000  # milliseconds between waves when house is open
+HOUSE_ENTER_KEY = pygame.K_e
+
+def load_font(path=None, size=32, fallback_names=None):
+    fallback_names = fallback_names or ["dejavusans", "arial", "noto sans", "liberation sans", "sans"]
+    if path:
+        try:
+            font = pygame.font.Font(path, size)
+            print(f"Loaded font from {path}")
+            return font
+        except Exception as e:
+            print(f"Failed to load font {path}: {e}")
+    for name in fallback_names:
+        try:
+            font_path = pygame.font.match_font(name)
+            if font_path:
+                font = pygame.font.Font(font_path, size)
+                print(f"Using system font '{name}' from {font_path}")
+                return font
+        except Exception:
+            pass
+    print("Using default pygame font")
+    return pygame.font.Font(None, size)
+
+HUD_FONT_SIZE = 20
+# Global small font used for in-game HUD (wave, zombies, pos, floating text)
+font = load_font(None, HUD_FONT_SIZE)
+
+DEFAULT_UNICODE_FALLBACKS = [
+    "dejavusans",
+    "noto sans",
+    "liberation sans",
+    "arial",
+    "sans",
+]
+
+MONO_UNICODE_FALLBACKS = [
+    "dejavusansmono",
+    "liberation mono",
+    "courier new",
+    "monospace",
+]
+
+# Use system Unicode-capable fonts for UI text so Russian/Ukrainian glyphs render correctly.
+ui_font = load_font(None, 48, fallback_names=DEFAULT_UNICODE_FALLBACKS)
+title_font = load_font(None, 72, fallback_names=DEFAULT_UNICODE_FALLBACKS)
+stats_font = load_font(None, 32, fallback_names=MONO_UNICODE_FALLBACKS)
+
+# =========================
+# WAVES
+# =========================
+BASE_WAVE_CONFIGS = {
+    1: {"enemies": 20, "spawn_rate": 2, "speed": 2.0},
+    2: {"enemies": 28, "spawn_rate": 2, "speed": 2.1},
+    3: {"enemies": 36, "spawn_rate": 2, "speed": 2.2},
+    4: {"enemies": 44, "spawn_rate": 2, "speed": 2.35},
+    5: {"enemies": 0, "spawn_rate": 2, "speed": 2.4, "boss": True},
+    6: {"enemies": 46, "spawn_rate": 2, "speed": 2.5},
+    7: {"enemies": 54, "spawn_rate": 2, "speed": 2.65},
+    8: {"enemies": 62, "spawn_rate": 2, "speed": 2.8},
+    9: {"enemies": 70, "spawn_rate": 2, "speed": 3.0},
+    10: {"enemies": 0, "spawn_rate": 2, "speed": 3.1, "boss": True, "final": True},
+}
+
+MAP_THEMES = [
+    {
+        "name": "Forest",
+        "tint": (255, 255, 255),
+        "overlay": (0, 0, 0, 0),
+        "detail": "none",
+        "enemy_tint": (255, 255, 255),
+        "boss_bullet_color": (255, 60, 60),
+        "mini_boss_bullet_color": (255, 210, 80),
+        "enemy_bullet_color": (90, 210, 255),
+        "difficulty": 1.0,
+        "speed_bonus": 0.0,
+        "spawn_rate": 2,
+    },
+    {
+        "name": "Winter",
+        "image": "map_winter.png",
+        "house_rect": (1070, 1160, 360, 360),
+        "tint": (190, 225, 255),
+        "overlay": (210, 235, 255, 42),
+        "detail": "snow",
+        "enemy_tint": (210, 235, 255),
+        "boss_bullet_color": (160, 230, 255),
+        "mini_boss_bullet_color": (210, 245, 255),
+        "enemy_bullet_color": (180, 240, 255),
+        "difficulty": 1.0,
+        "speed_bonus": 0.0,
+        "spawn_rate": 2,
+    },
+    {
+        "name": "Inferno",
+        "image": "map_inferno.png",
+        "house_rect": (1020, 1160, 360, 360),
+        "tint": (255, 145, 85),
+        "overlay": (95, 18, 5, 54),
+        "detail": "lava",
+        "enemy_tint": (255, 185, 115),
+        "boss_bullet_color": (255, 80, 20),
+        "mini_boss_bullet_color": (255, 155, 45),
+        "enemy_bullet_color": (255, 110, 35),
+        "difficulty": 1.25,
+        "speed_bonus": 0.18,
+        "spawn_rate": 2,
+    },
+    {
+        "name": "Swamp",
+        "image": "map_swamp.png",
+        "house_rect": (850, 1160, 360, 360),
+        "tint": (155, 210, 145),
+        "overlay": (20, 60, 35, 48),
+        "detail": "swamp",
+        "enemy_tint": (185, 230, 125),
+        "boss_bullet_color": (150, 255, 90),
+        "mini_boss_bullet_color": (210, 235, 80),
+        "enemy_bullet_color": (115, 255, 130),
+        "difficulty": 1.38,
+        "speed_bonus": 0.22,
+        "spawn_rate": 2,
+    },
+    {
+        "name": "Night City",
+        "image": "map_city.png",
+        "house_rect": (860, 1160, 360, 360),
+        "tint": (135, 145, 215),
+        "overlay": (12, 14, 42, 72),
+        "detail": "neon",
+        "enemy_tint": (205, 185, 255),
+        "boss_bullet_color": (255, 70, 190),
+        "mini_boss_bullet_color": (120, 255, 235),
+        "enemy_bullet_color": (180, 95, 255),
+        "difficulty": 1.55,
+        "speed_bonus": 0.32,
+        "spawn_rate": 1,
+    },
+]
+FINAL_WAVE = WAVES_PER_MAP * len(MAP_THEMES)
+
+
+def build_theme_waves(theme):
+    waves = {}
+    for wave_number, config in BASE_WAVE_CONFIGS.items():
+        themed_config = config.copy()
+        themed_config["enemies"] = int(config["enemies"] * theme["difficulty"])
+        themed_config["speed"] = round(config["speed"] + theme["speed_bonus"], 2)
+        themed_config["spawn_rate"] = theme["spawn_rate"]
+        if wave_number == WAVES_PER_MAP:
+            themed_config["final"] = False
+        waves[wave_number] = themed_config
+    return waves
+
+
+for theme in MAP_THEMES:
+    theme["waves"] = build_theme_waves(theme)
+
+MAP_THEMES[-1]["waves"][WAVES_PER_MAP]["final"] = True
+
+
+def map_index_for_wave(w):
+    return max(0, min((w - 1) // WAVES_PER_MAP, len(MAP_THEMES) - 1))
+
+
+def wave_in_map(w):
+    return ((w - 1) % WAVES_PER_MAP) + 1
+
+
+def map_theme_for_wave(w):
+    return MAP_THEMES[map_index_for_wave(w)]
+
+
+def wave_size(w):
+    return wave_config(w)["enemies"]
+
+
+def wave_config(w):
+    theme = map_theme_for_wave(w)
+    return theme["waves"][wave_in_map(w)]
+
+# =========================
+# HELPERS
+# =========================
+def draw_text(text, pos, color=(255, 255, 255), size=40, font=None, glow_color=None, glow_radius=0):
+    if font is None:
+        font = load_font(None, size)
+    if glow_color and glow_radius > 0:
+        glow_surface = font.render(text, True, glow_color)
+        for dx in range(-glow_radius, glow_radius + 1):
+            for dy in range(-glow_radius, glow_radius + 1):
+                if dx == 0 and dy == 0:
+                    continue
+                screen.blit(glow_surface, (pos[0] + dx, pos[1] + dy))
+    screen.blit(font.render(text, True, color), pos)
+
+
+def draw_text_center(text, y, color=(255, 255, 255), size=40, font=None, glow_color=None, glow_radius=0):
+    if font is None:
+        font = load_font(None, size)
+    text_surface = font.render(text, True, color)
+    x = WIDTH // 2 - text_surface.get_width() // 2
+    if glow_color and glow_radius > 0:
+        glow_surface = font.render(text, True, glow_color)
+        for dx in range(-glow_radius, glow_radius + 1):
+            for dy in range(-glow_radius, glow_radius + 1):
+                if dx == 0 and dy == 0:
+                    continue
+                screen.blit(glow_surface, (x + dx, y + dy))
+    screen.blit(text_surface, (x, y))
+
+
+def start_ambient_sound():
+    if not pygame.mixer.get_init():
+        return
+    if pygame.mixer.music.get_busy():
+        return
+
+    try:
+        pygame.mixer.music.load(os.path.join(ASSETS_DIR, "sound", "map.mp3"))
+        pygame.mixer.music.set_volume(SETTINGS["music_volume"])
+        pygame.mixer.music.play(loops=-1, fade_ms=1200)
+    except pygame.error as e:
+        print(f"Ambient sound disabled: {e}")
+
+
+def stop_ambient_sound():
+    if pygame.mixer.get_init() and pygame.mixer.music.get_busy():
+        pygame.mixer.music.fadeout(500)
+
+
+# =========================
+# SAVE DATA
+# =========================
+def load_save_data():
+    if not os.path.exists(SAVE_PATH):
+        return {}
+
+    try:
+        with open(SAVE_PATH, "r", encoding="utf-8") as save_file:
+            return json.load(save_file)
+    except (OSError, json.JSONDecodeError) as e:
+        print(f"Save data ignored: {e}")
+        return {}
+
+
+def save_progress(best_score):
+    data = {
+        "best_score": best_score,
+        "unlocked_weapons": sorted(unlocked_weapons),
+        "current_weapon": current_weapon,
+        "max_medkits": MAX_MEDKITS,
+        "weapon_upgrades": weapon_upgrades,
+        "settings": SETTINGS,
+    }
+
+    try:
+        with open(SAVE_PATH, "w", encoding="utf-8") as save_file:
+            json.dump(data, save_file, indent=2)
+    except OSError as e:
+        print(f"Save failed: {e}")
+
+
+def save_settings_only():
+    data = load_save_data()
+    data["settings"] = SETTINGS
+    try:
+        with open(SAVE_PATH, "w", encoding="utf-8") as save_file:
+            json.dump(data, save_file, indent=2)
+    except OSError as e:
+        print(f"Settings save failed: {e}")
+
+
+def weapon_upgrade_level(weapon_key, upgrade_key):
+    return weapon_upgrades.get(weapon_key, {}).get(upgrade_key, 0)
+
+
+def weapon_upgrade_cost(weapon_key, upgrade_key):
+    level = weapon_upgrade_level(weapon_key, upgrade_key)
+    costs = UPGRADE_COSTS[upgrade_key]
+    if level >= len(costs):
+        return None
+    base_cost = costs[level]
+    return base_cost + WEAPONS[weapon_key]["cost"] // 5
+
+
+def weapon_damage(weapon_key):
+    return WEAPONS[weapon_key]["damage"] + weapon_upgrade_level(weapon_key, "damage")
+
+
+def weapon_magazine_size(weapon_key):
+    base = WEAPONS[weapon_key]["magazine"]
+    return base + int(base * 0.25) * weapon_upgrade_level(weapon_key, "magazine")
+
+
+def weapon_reload_time(weapon_key):
+    base = WEAPONS[weapon_key]["reload_time"]
+    return max(300, int(base * (1 - 0.15 * weapon_upgrade_level(weapon_key, "reload"))))
+
+
+def tr(key):
+    language = SETTINGS.get("language", "en")
+    return TEXT.get(language, TEXT["en"]).get(key, TEXT["en"].get(key, key))
+
+
+def weapon_display_name(weapon_key):
+    # Try translation first, then fallback to WEAPONS table
+    name_key = f"weapon_{weapon_key}"
+    language = SETTINGS.get("language", "en")
+    return TEXT.get(language, TEXT["en"]).get(name_key, WEAPONS.get(weapon_key, {}).get("name", weapon_key))
+
+
+def cycle_language(step=1):
+    codes = list(LANGUAGES.keys())
+    current = SETTINGS.get("language", "en")
+    index = codes.index(current) if current in codes else 0
+    SETTINGS["language"] = codes[(index + step) % len(codes)]
+
+
+# =========================
+# UTILITY
+# =========================
+def tint_surface(surface, color):
+    tinted = surface.copy()
+    tinted.fill(color, special_flags=pygame.BLEND_MULT)
+    return tinted
+
+
+def create_themed_map_surface(base_surface, theme, seed):
+    image_name = theme.get("image")
+    if image_name:
+        image_path = os.path.join(ASSETS_DIR, image_name)
+        if os.path.exists(image_path):
+            return pygame.image.load(image_path).convert()
+
+    themed = tint_surface(base_surface, theme["tint"])
+    overlay_color = theme["overlay"]
+    if overlay_color[3] > 0:
+        overlay = pygame.Surface(base_surface.get_size(), pygame.SRCALPHA)
+        overlay.fill(overlay_color)
+        themed.blit(overlay, (0, 0))
+
+    detail_rng = random.Random(seed)
+    detail = theme["detail"]
+    if detail == "snow":
+        for _ in range(260):
+            x = detail_rng.randrange(0, base_surface.get_width())
+            y = detail_rng.randrange(0, base_surface.get_height())
+            radius = detail_rng.choice((1, 1, 2, 3))
+            pygame.draw.circle(themed, (235, 248, 255, 78), (x, y), radius)
+    elif detail == "lava":
+        for _ in range(42):
+            x = detail_rng.randrange(0, base_surface.get_width())
+            y = detail_rng.randrange(0, base_surface.get_height())
+            length = detail_rng.randrange(70, 210)
+            end = (min(base_surface.get_width(), x + length), y + detail_rng.randrange(-18, 19))
+            pygame.draw.line(themed, (255, 75, 18, 95), (x, y), end, detail_rng.randrange(2, 5))
+            pygame.draw.line(themed, (255, 190, 45, 80), (x, y), end, 1)
+    elif detail == "swamp":
+        for _ in range(55):
+            x = detail_rng.randrange(0, base_surface.get_width())
+            y = detail_rng.randrange(0, base_surface.get_height())
+            width = detail_rng.randrange(45, 120)
+            height = detail_rng.randrange(18, 44)
+            pygame.draw.ellipse(themed, (45, 95, 55, 68), (x, y, width, height))
+    elif detail == "neon":
+        neon_colors = [(255, 55, 185, 125), (65, 235, 255, 125), (185, 95, 255, 115)]
+        for _ in range(32):
+            x = detail_rng.randrange(0, base_surface.get_width())
+            y = detail_rng.randrange(0, base_surface.get_height())
+            length = detail_rng.randrange(55, 180)
+            color = detail_rng.choice(neon_colors)
+            pygame.draw.line(themed, color, (x, y), (x + length, y), detail_rng.randrange(2, 5))
+
+    return themed
+
+
+for theme_index, theme in enumerate(MAP_THEMES):
+    theme["surface"] = create_themed_map_surface(base_map_img, theme, theme_index + 7)
+
+
+map_img = MAP_THEMES[0]["surface"]
+
+
+def draw_player_character(rect, camera_x, camera_y, moving, direction, weapon_key, fallback_sprite, hurt=False):
+    screen_rect = rect.move(-camera_x, -camera_y)
+    if not PLAYER_PARTS_READY:
+        if hurt:
+            fallback_sprite = tint_surface(fallback_sprite, (255, 150, 150))
+        screen.blit(fallback_sprite, screen_rect)
+        return
+
+    x = screen_rect.x
+    y = screen_rect.y
+    walk = math.sin(pygame.time.get_ticks() * 0.014) if moving else 0
+    head_bob = int(abs(walk) * 2)
+    arm_swing = int(walk * 4)
+    leg_swing = int(walk * 4)
+    flip = direction == (-1, 0)
+
+    def part(name):
+        image = PLAYER_PARTS[name]
+        if hurt:
+            image = tint_surface(image, (255, 150, 150))  # Red tint
+        return pygame.transform.flip(image, True, False) if flip else image
+
+    leg_left_pos = (x + 18, y + 43 + leg_swing)
+    leg_right_pos = (x + 30, y + 43 - leg_swing)
+    body_pos = (x + 15, y + 18 + head_bob)
+    head_pos = (x + 13, y - 2 + head_bob)
+    arm_back_pos = (x + 13, y + 22 - arm_swing)
+    arm_front_pos = (x + 38, y + 22 + arm_swing)
+
+    if flip:
+        arm_back_pos, arm_front_pos = arm_front_pos, arm_back_pos
+
+    screen.blit(part("leg_left"), leg_left_pos)
+    screen.blit(part("leg_right"), leg_right_pos)
+    screen.blit(part("arm_left"), arm_back_pos)
+    screen.blit(part("arm_right"), arm_front_pos)
+    screen.blit(part("body"), body_pos)
+    screen.blit(part("head"), head_pos)
+
+    weapon_img = WEAPON_IMAGES.get(weapon_key)
+    if weapon_img:
+        weapon = pygame.transform.flip(weapon_img, True, False) if flip else weapon_img
+        if direction == (0, -1):
+            weapon_pos = (x + 28, y + 12 + head_bob)
+            weapon = pygame.transform.rotate(weapon, 90)
+        elif direction == (0, 1):
+            weapon_pos = (x + 26, y + 34 + head_bob)
+            weapon = pygame.transform.rotate(weapon, -90)
+        elif flip:
+            weapon_pos = (x + 2, y + 27 + head_bob)
+        else:
+            weapon_pos = (x + 33, y + 27 + head_bob)
+        if hurt:
+            weapon = tint_surface(weapon, (255, 150, 150))
+        screen.blit(weapon, weapon_pos)
+
+
+def shop_menu(score):
+    global current_weapon
+
+    options = weapon_order + ["back"]
+    selected = 0
+    message = tr("buy_or_select_weapon")
+    pygame.mouse.set_visible(True)
+
+    def option_label(option):
+        if option == "back":
+            return tr("back")
+
+        weapon = WEAPONS[option]
+        state = tr("selected") if option == current_weapon else (tr("owned") if option in unlocked_weapons else f"{weapon['cost']} {tr('points')}")
+        return f"{weapon_display_name(option)} - {state}"
+
+    def activate_choice(choice):
+        nonlocal message
+        global current_weapon
+
+        if choice == "back":
+            return True
+
+        weapon = WEAPONS[choice]
+        if choice in unlocked_weapons:
+            current_weapon = choice
+            message = f"{tr('selected')}: {weapon_display_name(choice)}"
+        elif score >= weapon["cost"]:
+            unlocked_weapons.add(choice)
+            current_weapon = choice
+            message = f"{tr('bought_and_selected')}: {weapon_display_name(choice)}"
+        else:
+            message = f"{tr('need')} {weapon['cost']} {tr('points')} to buy {weapon_display_name(choice)}"
+
+        return False
+
+    while True:
+        screen.blit(menu_img, (0, 0))
+        button_x = 100
+        button_y = HEIGHT // 2 - 80
+        labels = [option_label(option) for option in options]
+        option_rects = []
+
+        for idx, label in enumerate(labels):
+            text_width, text_height = ui_font.size(label)
+            option_rects.append(pygame.Rect(button_x - 10, button_y + idx * 50 - 4, text_width + 20, text_height + 8))
+
+        mouse_pos = pygame.mouse.get_pos()
+        for idx, rect in enumerate(option_rects):
+            if rect.collidepoint(mouse_pos):
+                selected = idx
+
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                return
+            if event.type == pygame.KEYDOWN:
+                if event.key == pygame.K_UP:
+                    selected = (selected - 1) % len(options)
+                if event.key == pygame.K_DOWN:
+                    selected = (selected + 1) % len(options)
+                if event.key == pygame.K_RETURN:
+                    choice = options[selected]
+                    if activate_choice(choice):
+                        return
+            if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+                for idx, rect in enumerate(option_rects):
+                    if rect.collidepoint(event.pos):
+                        selected = idx
+                        if activate_choice(options[selected]):
+                            return
+
+        draw_text_center(tr("weapon_shop").upper(), HEIGHT // 4, (255, 230, 200), font=title_font, glow_color=(220, 140, 60), glow_radius=2)
+        draw_text_center(f"{tr('your_points')}: {score}", HEIGHT // 4 + 80, (240, 210, 180), font=stats_font)
+        draw_text_center(message, HEIGHT // 4 + 120, (255, 235, 170), font=stats_font)
+
+        for idx, label in enumerate(labels):
+            if idx == selected:
+                draw_text(
+                    label,
+                    (button_x, button_y + idx * 50),
+                    (255, 245, 220),
+                    font=ui_font,
+                    glow_color=(210, 120, 40),
+                    glow_radius=1
+                )
+            else:
+                draw_text(label, (button_x, button_y + idx * 50), (220, 195, 170), font=ui_font)
+
+        pygame.display.flip()
+        clock.tick(60)
+
+
+def house_interior(coins, current_mag_ammo, spare_mags, player_hp):
+    """Display house interior with expanded shop. Returns updated coins, ammo, and HP."""
+    global current_weapon, MAX_MEDKITS
+    
+    current_coins = coins
+    options = weapon_order + [
+        "buy_ammo",
+        "upgrade_damage",
+        "upgrade_magazine",
+        "upgrade_reload",
+        "rest_heal",
+        "upgrade_medkit_capacity",
+        "exit_house",
+    ]
+    selected = 0
+    message = tr("welcome_safe_house")
+    pygame.mouse.set_visible(True)
+
+    def selected_weapon():
+        return WEAPONS[current_weapon]
+
+    def ammo_is_full():
+        return current_mag_ammo >= weapon_magazine_size(current_weapon) and spare_mags >= MAX_SPARE_MAGAZINES
+
+    def upgrade_label(option, upgrade_key, title):
+        level = weapon_upgrade_level(current_weapon, upgrade_key)
+        cost = weapon_upgrade_cost(current_weapon, upgrade_key)
+        if cost is None:
+            return f"{title} - Max ({level}/{MAX_WEAPON_UPGRADE_LEVEL})"
+        return f"{title} - {cost} coins ({level}/{MAX_WEAPON_UPGRADE_LEVEL})"
+
+    def option_label(option):
+        if option == "exit_house":
+            return tr("exit_house")
+        if option == "buy_ammo":
+            weapon = selected_weapon()
+            if ammo_is_full():
+                state = tr("full")
+            else:
+                state = f"{weapon['ammo_cost']} {tr('coins')} ({tr('plus_mag')})"
+            return f"{tr('buy_ammo')} - {state}"
+        if option == "upgrade_damage":
+            return upgrade_label(option, "damage", tr("upgrade_damage"))
+        if option == "upgrade_magazine":
+            return upgrade_label(option, "magazine", tr("upgrade_magazine"))
+        if option == "upgrade_reload":
+            return upgrade_label(option, "reload", tr("upgrade_reload"))
+        if option == "rest_heal":
+            if player_hp >= PLAYER_MAX_HP:
+                state = tr("full")
+            else:
+                state = f"50 {tr('coins')} (restore 50 HP)"
+            return f"{tr('rest_heal')} - {state}"
+        if option == "upgrade_medkit_capacity":
+            if MAX_MEDKITS >= MAX_MEDKIT_CAPACITY:
+                state = tr("full")
+            else:
+                state = f"100 {tr('coins')} (+1 slot)"
+            return f"{tr('upgrade_medkit_capacity')} - {state}"
+
+        weapon = WEAPONS[option]
+        state = tr("selected") if option == current_weapon else (tr("owned") if option in unlocked_weapons else f"{weapon['cost']} {tr('coins')}")
+        return f"{weapon_display_name(option)} - {state}"
+
+    def activate_choice(choice):
+        nonlocal message, current_coins, current_mag_ammo, spare_mags, player_hp
+        global current_weapon, MAX_MEDKITS
+
+        if choice == "exit_house":
+            return True
+
+        if choice == "buy_ammo":
+            weapon = selected_weapon()
+            if ammo_is_full():
+                message = tr("full")
+                return False
+            if current_coins < weapon["ammo_cost"]:
+                message = f"{tr('need')} {weapon['ammo_cost']} {tr('coins')} to buy ammo"
+                return False
+
+            current_coins -= weapon["ammo_cost"]
+            if current_mag_ammo < weapon_magazine_size(current_weapon):
+                current_mag_ammo = weapon_magazine_size(current_weapon)
+                message = f"{weapon_display_name(current_weapon)} loaded"
+            else:
+                spare_mags += 1
+                message = f"{tr('bought_and_selected')} ({spare_mags}/{MAX_SPARE_MAGAZINES})"
+            return False
+
+        if choice in ("upgrade_damage", "upgrade_magazine", "upgrade_reload"):
+            upgrade_key = {
+                "upgrade_damage": "damage",
+                "upgrade_magazine": "magazine",
+                "upgrade_reload": "reload",
+            }[choice]
+            cost = weapon_upgrade_cost(current_weapon, upgrade_key)
+            if cost is None:
+                message = tr("full")
+                return False
+            if current_coins < cost:
+                message = f"Need {cost} coins for upgrade"
+                return False
+            current_coins -= cost
+            weapon_upgrades[current_weapon][upgrade_key] += 1
+            if upgrade_key == "magazine":
+                current_mag_ammo = weapon_magazine_size(current_weapon)
+            message = f"{weapon_display_name(current_weapon)} {upgrade_key} upgraded"
+            return False
+        
+        if choice == "rest_heal":
+            if player_hp >= PLAYER_MAX_HP:
+                message = tr("full")
+                return False
+            if current_coins >= 50:
+                current_coins -= 50
+                player_hp = min(PLAYER_MAX_HP, player_hp + 50)
+                message = tr("rest_heal")
+                return False
+            else:
+                message = f"{tr('need')} 50 {tr('coins')} to rest"
+                return False
+        
+        if choice == "upgrade_medkit_capacity":
+            if MAX_MEDKITS >= MAX_MEDKIT_CAPACITY:
+                message = tr("full")
+                return False
+            if current_coins >= 100:
+                current_coins -= 100
+                MAX_MEDKITS += 1
+                message = f"Medkit capacity upgraded! Now: {MAX_MEDKITS}"
+                return False
+            else:
+                message = f"{tr('need')} 100 {tr('coins')} to upgrade"
+                return False
+
+        weapon = WEAPONS[choice]
+        if choice in unlocked_weapons:
+            current_weapon = choice
+            current_mag_ammo = weapon_magazine_size(current_weapon)
+            spare_mags = BASE_SPARE_MAGAZINES
+            message = f"{tr('selected')}: {weapon_display_name(choice)}"
+        elif current_coins >= weapon["cost"]:
+            current_coins -= weapon["cost"]
+            unlocked_weapons.add(choice)
+            current_weapon = choice
+            current_mag_ammo = weapon_magazine_size(current_weapon)
+            spare_mags = BASE_SPARE_MAGAZINES
+            message = f"{tr('bought_and_selected')}: {weapon_display_name(choice)}"
+        else:
+            message = f"{tr('need')} {weapon['cost']} {tr('coins')} to buy {weapon_display_name(choice)}"
+
+        return False
+
+    while True:
+        screen_rect = screen.get_rect()
+        # Draw house interior background
+        screen.fill((40, 30, 20))  # Dark brown/wood color
+        
+        # Draw wooden frame/border
+        outer_frame = screen_rect.inflate(-110, -110)
+        inner_frame = screen_rect.inflate(-135, -135)
+        pygame.draw.rect(screen, (80, 60, 40), outer_frame, 8)
+        pygame.draw.rect(screen, (100, 80, 60), inner_frame, 2)
+        
+        # Draw shelves/display areas
+        pygame.draw.line(screen, (120, 100, 80), (inner_frame.left + 20, inner_frame.bottom - 110), (inner_frame.right - 20, inner_frame.bottom - 110), 2)
+        
+        button_x = 80
+        button_y = 80
+        option_step = 42
+        option_font = stats_font
+        labels = [option_label(option) for option in options]
+        option_rects = []
+
+        for idx, label in enumerate(labels):
+            text_width, text_height = option_font.size(label)
+            option_rects.append(pygame.Rect(button_x - 10, button_y + idx * option_step - 4, text_width + 20, text_height + 8))
+
+        mouse_pos = pygame.mouse.get_pos()
+        for idx, rect in enumerate(option_rects):
+            if rect.collidepoint(mouse_pos):
+                selected = idx
+
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                return current_coins, current_mag_ammo, spare_mags, player_hp
+            if event.type == pygame.KEYDOWN:
+                if event.key == pygame.K_UP:
+                    selected = (selected - 1) % len(options)
+                if event.key == pygame.K_DOWN:
+                    selected = (selected + 1) % len(options)
+                if event.key == pygame.K_RETURN:
+                    choice = options[selected]
+                    if activate_choice(choice):
+                        return current_coins, current_mag_ammo, spare_mags, player_hp
+                if event.key == pygame.K_ESCAPE:
+                    return current_coins, current_mag_ammo, spare_mags, player_hp
+            if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+                for idx, rect in enumerate(option_rects):
+                    if rect.collidepoint(event.pos):
+                        selected = idx
+                        if activate_choice(options[selected]):
+                            return current_coins, current_mag_ammo, spare_mags, player_hp
+
+        draw_text_center("SAFE HOUSE", 80, (200, 180, 160), font=title_font, glow_color=(150, 120, 80), glow_radius=2)
+        draw_text_center(f"Available Coins: {current_coins}", 165, (180, 160, 140), font=stats_font)
+        draw_text_center(message, inner_frame.bottom - 70, (200, 220, 180), font=stats_font)
+
+        for idx, label in enumerate(labels):
+            if idx == selected:
+                draw_text(
+                    label,
+                    (button_x, button_y + idx * option_step),
+                    (255, 245, 220),
+                    font=option_font,
+                    glow_color=(200, 160, 100),
+                    glow_radius=1
+                )
+            else:
+                color = (220, 200, 180) if idx < len(weapon_order) else (180, 200, 200)
+                draw_text(label, (button_x, button_y + idx * option_step), color, font=option_font)
+
+        pygame.display.flip()
+        clock.tick(60)
+    
+    return current_coins, current_mag_ammo, spare_mags, player_hp
+
+
+def settings_menu():
+    global screen
+
+    options = ["music", "sfx", "fullscreen", "language", "back"]
+    selected = 0
+    pygame.mouse.set_visible(True)
+
+    def option_label(option):
+        if option == "music":
+            return f"{tr('music_volume')}: {int(SETTINGS['music_volume'] * 100)}%"
+        if option == "sfx":
+            return f"{tr('sfx_volume')}: {int(SETTINGS['sfx_volume'] * 100)}%"
+        if option == "fullscreen":
+            state = tr("on") if SETTINGS["fullscreen"] else tr("off")
+            return f"{tr('fullscreen')}: {state}"
+        if option == "language":
+            return f"{tr('language')}: {LANGUAGES.get(SETTINGS['language'], 'English')}"
+        return tr("back")
+
+    def change_value(option, amount):
+        global screen
+        changed = False
+        if option == "music":
+            SETTINGS["music_volume"] = max(0, min(1, SETTINGS["music_volume"] + amount))
+            if pygame.mixer.get_init():
+                pygame.mixer.music.set_volume(SETTINGS["music_volume"])
+            changed = True
+        elif option == "sfx":
+            SETTINGS["sfx_volume"] = max(0, min(1, SETTINGS["sfx_volume"] + amount))
+            changed = True
+        elif option == "fullscreen" and amount != 0:
+            SETTINGS["fullscreen"] = not SETTINGS["fullscreen"]
+            flags = pygame.FULLSCREEN if SETTINGS["fullscreen"] else 0
+            screen = pygame.display.set_mode((WIDTH, HEIGHT), flags)
+            changed = True
+        elif option == "language" and amount != 0:
+            cycle_language(1 if amount > 0 else -1)
+            changed = True
+
+        if changed:
+            save_settings_only()
+
+    while True:
+        screen.blit(menu_img, (0, 0))
+        labels = [option_label(option) for option in options]
+        button_x = 80
+        button_y = HEIGHT // 2 - 80
+        option_rects = []
+
+        for idx, label in enumerate(labels):
+            text_width, text_height = ui_font.size(label)
+            option_rects.append(pygame.Rect(button_x - 10, button_y + idx * 70 - 4, text_width + 20, text_height + 8))
+
+        mouse_pos = pygame.mouse.get_pos()
+        for idx, rect in enumerate(option_rects):
+            if rect.collidepoint(mouse_pos):
+                selected = idx
+
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                return
+            if event.type == pygame.KEYDOWN:
+                if event.key == pygame.K_UP:
+                    selected = (selected - 1) % len(options)
+                elif event.key == pygame.K_DOWN:
+                    selected = (selected + 1) % len(options)
+                elif event.key == pygame.K_LEFT:
+                    change_value(options[selected], -0.1)
+                elif event.key == pygame.K_RIGHT:
+                    change_value(options[selected], 0.1)
+                elif event.key == pygame.K_RETURN:
+                    if options[selected] == "back":
+                        return
+                    change_value(options[selected], 1)
+                elif event.key == pygame.K_ESCAPE:
+                    return
+            if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+                for idx, rect in enumerate(option_rects):
+                    if rect.collidepoint(event.pos):
+                        selected = idx
+                        if options[selected] == "back":
+                            return
+                        change_value(options[selected], 1)
+
+        draw_text_center(tr("settings").upper(), HEIGHT // 3 - 70, (255, 230, 200), font=title_font, glow_color=(220, 140, 60), glow_radius=2)
+        draw_text_center(tr("settings_hint"), HEIGHT // 3, (230, 215, 190), font=stats_font)
+
+        for idx, label in enumerate(labels):
+            color = (255, 245, 220) if idx == selected else (220, 195, 170)
+            glow = (210, 120, 40) if idx == selected else None
+            draw_text(label, (button_x, button_y + idx * 70), color, font=ui_font, glow_color=glow, glow_radius=1 if glow else 0)
+
+        pygame.display.flip()
+        clock.tick(60)
+
+
+def menu(best_score, last_score):
+    options = ["start", "shop", "settings", "quit"]
+    selected = 0
+    pygame.mouse.set_visible(True)
+
+    def activate_choice(choice):
+        if choice == "start":
+            return True
+        if choice == "shop":
+            shop_menu(best_score)
+            return None
+        if choice == "settings":
+            settings_menu()
+            return None
+        return False
+
+    def option_label(option):
+        if option == "start":
+            return tr("start_game")
+        if option == "shop":
+            return tr("weapon_shop")
+        if option == "settings":
+            return tr("settings")
+        return tr("quit")
+
+    while True:
+        screen.blit(menu_img, (0, 0))
+        button_x = 80
+        button_y = HEIGHT // 2 + 40
+        option_rects = []
+
+        labels = [option_label(option) for option in options]
+        for idx, label in enumerate(labels):
+            text_width, text_height = ui_font.size(label)
+            option_rects.append(pygame.Rect(button_x - 10, button_y + idx * 80 - 4, text_width + 20, text_height + 8))
+
+        mouse_pos = pygame.mouse.get_pos()
+        for idx, rect in enumerate(option_rects):
+            if rect.collidepoint(mouse_pos):
+                selected = idx
+
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                return False
+            if event.type == pygame.KEYDOWN:
+                if event.key == pygame.K_UP:
+                    selected = (selected - 1) % len(options)
+                if event.key == pygame.K_DOWN:
+                    selected = (selected + 1) % len(options)
+                if event.key == pygame.K_RETURN:
+                    result = activate_choice(options[selected])
+                    if result is not None:
+                        return result
+            if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+                for idx, rect in enumerate(option_rects):
+                    if rect.collidepoint(event.pos):
+                        selected = idx
+                        result = activate_choice(options[selected])
+                        if result is not None:
+                            return result
+
+        draw_text_center(
+            "Wave Survival Boss Fight",
+            HEIGHT // 3 - 40,
+            (255, 230, 200),
+            font=title_font,
+            glow_color=(220, 140, 60),
+            glow_radius=2
+        )
+        draw_text_center(f"{tr('last_score')}: {last_score}", HEIGHT // 3 + 60, (240, 210, 180), font=stats_font)
+        draw_text_center(f"{tr('record')}: {best_score}", HEIGHT // 3 + 110, (240, 210, 180), font=stats_font)
+
+        for idx, label in enumerate(labels):
+            if idx == selected:
+                draw_text(
+                    label,
+                    (button_x, button_y + idx * 80),
+                    (255, 245, 220),
+                    font=ui_font,
+                    glow_color=(210, 120, 40),
+                    glow_radius=1
+                )
+            else:
+                draw_text(label, (button_x, button_y + idx * 80), (220, 195, 170), font=ui_font)
+
+        pygame.display.flip()
+        clock.tick(60)
+
+
+def game_over_screen(score):
+    pygame.mouse.set_visible(True)
+    while True:
+        screen.fill((10, 10, 20))
+
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                return
+            if event.type == pygame.KEYDOWN:
+                if event.key == pygame.K_RETURN:
+                    return
+
+        draw_text("GAME OVER", (WIDTH//2 - 180, HEIGHT//3 - 40), (255, 80, 80), 64)
+        draw_text(f"Final Score: {score}", (WIDTH//2 - 150, HEIGHT//3 + 40), (255, 255, 255), 40)
+
+        pygame.display.flip()
+        clock.tick(60)
+
+
+def victory_screen(score):
+    pygame.mouse.set_visible(True)
+    while True:
+        screen.fill((12, 24, 18))
+
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                return
+            if event.type == pygame.KEYDOWN:
+                if event.key == pygame.K_RETURN:
+                    return
+
+        draw_text_center("VICTORY", HEIGHT // 3 - 40, (180, 255, 190), 64, font=title_font, glow_color=(60, 160, 90), glow_radius=2)
+        draw_text_center(f"Final Score: {score}", HEIGHT // 3 + 55, (245, 245, 220), font=stats_font)
+        draw_text_center("Press Enter", HEIGHT // 3 + 110, (210, 230, 210), font=stats_font)
+
+        pygame.display.flip()
+        clock.tick(60)
+
+# =========================
+# GAME
+# =========================
+def draw_pause_menu():
+    # Semi-transparent overlay
+    overlay = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
+    overlay.fill((0, 0, 0, 128))  # Black with 50% alpha
+    screen.blit(overlay, (0, 0))
+
+    pygame.mouse.set_visible(True)
+
+    # Buttons as text, like main menu
+    options = [tr("resume_game"), tr("settings"), tr("exit_to_menu")]
+    button_x = 80
+    button_y = HEIGHT // 2 + 40
+    option_rects = []
+
+    for idx, option in enumerate(options):
+        text_width, text_height = ui_font.size(option)
+        option_rects.append(pygame.Rect(button_x - 10, button_y + idx * 80 - 4, text_width + 20, text_height + 8))
+
+    global selected
+    mouse_pos = pygame.mouse.get_pos()
+    selected = -1
+    for idx, rect in enumerate(option_rects):
+        if rect.collidepoint(mouse_pos):
+            selected = idx
+
+    for idx, option in enumerate(options):
+        color = (255, 255, 0) if idx == selected else (255, 255, 255)
+        draw_text(option, (button_x, button_y + idx * 80), color, font=ui_font)
+
+    # Store button rects for click detection
+    global resume_rect, settings_rect, exit_rect
+    resume_rect = option_rects[0]
+    settings_rect = option_rects[1]
+    exit_rect = option_rects[2]
+
+def game():
+    global resume_rect, exit_rect, selected
+    start_ambient_sound()
+
+    player = pygame.Rect(WORLD_WIDTH//2, WORLD_HEIGHT//2, 60, 60)
+    weapon = WEAPONS[current_weapon]
+    player_sprite = weapon["sprite"]
+    player_hp = PLAYER_MAX_HP
+    medkits = 0
+    last_player_hit = -PLAYER_HIT_COOLDOWN
+    player_hurt_timer = 0
+    paused = False
+    selected = 0
+    start_time = pygame.time.get_ticks()
+    waiting_for_next_wave = False
+    wave_break_end = 0
+    pending_boss_level_up = False
+    house_entered_this_break = False
+    house_message = ""
+    in_house = False
+
+    bullets = []
+    enemies = []
+    mini_bosses = []
+    boss_bullets = []
+    mini_boss_bullets = []
+    enemy_bullets = []
+    ammo_pickups = []
+    medkit_pickups = []
+    particles = []
+    floating_texts = []
+
+    wave = 1
+    level = 1
+
+    enemy_count = wave_size(wave)
+    spawned = 0
+    mini_bosses_spawned = 0
+
+    enemy_speed = wave_config(wave)["speed"]
+    spawn_rate = wave_config(wave)["spawn_rate"]
+
+    boss = None
+    boss_hp = 0
+    boss_max_hp = 0
+
+    score = 0
+
+    last_shot = 0
+    shoot_delay = weapon["delay"]
+    look_dir = (1, 0)
+    is_moving = False
+    reloading = False
+    reload_end = 0
+    status_message = f"{map_theme_for_wave(wave)['name']} - Wave {wave_in_map(wave)}/{WAVES_PER_MAP}"
+    status_message_until = pygame.time.get_ticks() + 2500
+
+    boss_last_shot = 0
+    boss_shoot_delay = 700
+    cheat_buffer = ""
+    cheat_chat_open = False
+    cheat_chat_text = ""
+
+    def magazine_size(weapon_key=None):
+        if weapon_key is None:
+            weapon_key = current_weapon
+        return weapon_magazine_size(weapon_key)
+
+    current_mag_ammo = magazine_size()
+    spare_mags = BASE_SPARE_MAGAZINES
+    coins = 0
+
+    def prepare_wave_ammo():
+        nonlocal current_mag_ammo, spare_mags, reloading
+        reloading = False
+        current_mag_ammo = magazine_size()
+        spare_mags = min(MAX_SPARE_MAGAZINES, max(spare_mags, BASE_SPARE_MAGAZINES))
+
+    def reload_weapon():
+        nonlocal reloading, reload_end
+        if reloading or current_mag_ammo >= magazine_size() or spare_mags <= 0:
+            return
+        reloading = True
+        reload_end = now + weapon_reload_time(current_weapon)
+
+    def add_floating_text(text, pos, color):
+        floating_texts.append({
+            "text": text,
+            "x": pos[0],
+            "y": pos[1],
+            "color": color,
+            "until": now + 900,
+        })
+
+    def add_particles(pos, color, count=8):
+        for _ in range(count):
+            angle = random.uniform(0, math.tau)
+            speed = random.uniform(1.2, 4.0)
+            particles.append({
+                "x": pos[0],
+                "y": pos[1],
+                "vx": math.cos(angle) * speed,
+                "vy": math.sin(angle) * speed,
+                "radius": random.randint(2, 5),
+                "color": color,
+                "until": now + random.randint(350, 700),
+            })
+
+    def drop_enemy_loot(enemy):
+        enemy_name = enemy["type"]["name"]
+        center = enemy["rect"].center
+        if enemy_name == "Spitter" and random.random() < 0.35:
+            ammo_pickups.append({"rect": pygame.Rect(center[0] - 12, center[1] - 12, 24, 24)})
+            add_floating_text("Ammo", center, (180, 220, 255))
+        elif enemy_name in ("Brute", "Toxic") and random.random() < 0.16:
+            medkit_pickups.append({"rect": pygame.Rect(center[0] - 12, center[1] - 12, 24, 24)})
+            add_floating_text("Medkit", center, (120, 255, 140))
+        elif enemy_name == "Walker" and random.random() < 0.04:
+            medkit_pickups.append({"rect": pygame.Rect(center[0] - 12, center[1] - 12, 24, 24)})
+
+    def set_status_message(text, duration=2200):
+        nonlocal status_message, status_message_until
+        status_message = text
+        status_message_until = now + duration
+
+    def wave_clear_reward():
+        return WAVE_CLEAR_BASE_COINS + wave * WAVE_CLEAR_COINS_PER_WAVE
+
+    def zombie_max_hp():
+        return ZOMBIE_BASE_HP + (level - 1) * ZOMBIE_HP_PER_LEVEL
+
+    def choose_enemy_type():
+        current_map_wave = wave_in_map(wave)
+        available = [
+            enemy_type for enemy_type in ENEMY_TYPES.values()
+            if current_map_wave >= enemy_type["wave"]
+        ]
+        total_weight = sum(enemy_type["weight"] for enemy_type in available)
+        roll = random.uniform(0, total_weight)
+        current = 0
+        for enemy_type in available:
+            current += enemy_type["weight"]
+            if roll <= current:
+                return enemy_type
+        return available[0]
+
+    def random_world_edge_position(width, height):
+        world_width, world_height = current_world_size()
+        edge = random.choice(["top", "bottom", "left", "right"])
+        if edge == "top":
+            return random.randint(0, world_width - width), 0
+        if edge == "bottom":
+            return random.randint(0, world_width - width), world_height - height
+        if edge == "left":
+            return 0, random.randint(0, world_height - height)
+        return world_width - width, random.randint(0, world_height - height)
+
+    def spawn_enemy():
+        enemy_type = choose_enemy_type()
+        size = enemy_type["size"]
+        max_hp = max(1, int(zombie_max_hp() * enemy_type["hp_mult"]))
+        x, y = random_world_edge_position(size, size)
+        sprite = tint_surface(enemy_img, map_theme_for_wave(wave)["enemy_tint"])
+        if enemy_type["tint"] != (255, 255, 255):
+            sprite = tint_surface(sprite, enemy_type["tint"])
+        if size != 50:
+            sprite = pygame.transform.scale(sprite, (size, size))
+        return {
+            "rect": pygame.Rect(x, y, size, size),
+            "hp": max_hp,
+            "max_hp": max_hp,
+            "type": enemy_type,
+            "sprite": sprite,
+            "last_shot": 0,
+        }
+
+    def mini_boss_max_hp():
+        return MINI_BOSS_BASE_HP + (level - 1) * MINI_BOSS_HP_PER_LEVEL
+
+    def mini_boss_count_for_wave():
+        current_map_wave = wave_in_map(wave)
+        if current_map_wave < 6:
+            return 0
+        return min(current_map_wave - 4, 5)
+
+    def spawn_mini_boss():
+        max_hp = mini_boss_max_hp()
+        x, y = random_world_edge_position(70, 70)
+        return {
+            "rect": pygame.Rect(x, y, 70, 70),
+            "hp": max_hp,
+            "max_hp": max_hp,
+            "last_shot": 0,
+        }
+
+    def spawn_boss():
+        world_width, world_height = current_world_size()
+        return pygame.Rect(world_width//2 - 110, world_height//2 - 300, 220, 220)
+
+    def make_player_bullets(direction):
+        vx, vy = direction
+        created = []
+        pellet_count = weapon["pellets"]
+        middle = pellet_count // 2
+
+        for i in range(pellet_count):
+            offset = i - middle
+            shot_vx = vx
+            shot_vy = vy
+
+            if weapon["spread"] and pellet_count > 1:
+                if vx == 0:
+                    shot_vx += offset * weapon["spread"]
+                else:
+                    shot_vy += offset * weapon["spread"]
+
+                length = math.hypot(shot_vx, shot_vy)
+                shot_vx /= length
+                shot_vy /= length
+
+            created.append({
+                "rect": pygame.Rect(player.centerx - 5, player.centery - 5, 10, 10),
+                "vx": shot_vx * weapon["speed"],
+                "vy": shot_vy * weapon["speed"],
+                "damage": weapon_damage(current_weapon),
+                "blast_radius": weapon["blast_radius"],
+            })
+
+        return created
+
+    def bullet_center(bullet):
+        return bullet["rect"].centerx, bullet["rect"].centery
+
+    def in_blast_radius(rect, center, radius):
+        if radius <= 0:
+            return False
+        return math.hypot(rect.centerx - center[0], rect.centery - center[1]) <= radius
+
+    def current_world_size():
+        return map_theme_for_wave(wave)["surface"].get_size()
+
+    def move_player_to_current_map_center():
+        world_width, world_height = current_world_size()
+        player.center = (world_width // 2, world_height // 2)
+        player.clamp_ip(pygame.Rect(0, 0, world_width, world_height))
+
+    def get_camera():
+        world_width, world_height = current_world_size()
+        camera_x = max(0, min(player.centerx - WIDTH // 2, world_width - WIDTH))
+        camera_y = max(0, min(player.centery - HEIGHT // 2, world_height - HEIGHT))
+        return camera_x, camera_y
+
+    def camera_rect(rect, camera_x, camera_y):
+        return rect.move(-camera_x, -camera_y)
+
+    def current_house_rect():
+        return pygame.Rect(map_theme_for_wave(wave).get("house_rect", HOUSE_RECT))
+
+    def hurt_player(damage):
+        nonlocal player_hp, last_player_hit, player_hurt_timer
+        if now - last_player_hit < PLAYER_HIT_COOLDOWN:
+            return False
+
+        player_hp -= damage
+        player_hurt_timer = 500
+        last_player_hit = now
+        return player_hp <= 0
+
+    def use_medkit():
+        nonlocal player_hp, medkits
+        if medkits <= 0 or player_hp >= PLAYER_MAX_HP:
+            return
+
+        medkits -= 1
+        player_hp = min(PLAYER_MAX_HP, player_hp + MEDKIT_HEAL_AMOUNT)
+
+    def skip_level_cheat():
+        nonlocal wave, level, enemy_count, spawned, mini_bosses_spawned
+        nonlocal enemy_speed, spawn_rate, boss, boss_hp, boss_max_hp
+        nonlocal waiting_for_next_wave, wave_break_end, pending_boss_level_up
+        nonlocal house_entered_this_break, house_message, in_house, reloading, reload_end
+        nonlocal boss_last_shot
+
+        current_map_index = map_index_for_wave(wave)
+        if current_map_index >= len(MAP_THEMES) - 1:
+            set_status_message("Cheat active: no more levels to skip", 2500)
+            return
+
+        next_map_index = current_map_index + 1
+        wave = next_map_index * WAVES_PER_MAP + 1
+        level = max(level, next_map_index + 1)
+        move_player_to_current_map_center()
+        enemy_count = wave_size(wave)
+        spawned = 0
+        mini_bosses_spawned = 0
+        enemy_speed = wave_config(wave)["speed"]
+        spawn_rate = wave_config(wave)["spawn_rate"]
+
+        enemies.clear()
+        mini_bosses.clear()
+        bullets.clear()
+        boss_bullets.clear()
+        mini_boss_bullets.clear()
+        enemy_bullets.clear()
+        ammo_pickups.clear()
+        medkit_pickups.clear()
+
+        boss = None
+        boss_hp = 0
+        boss_max_hp = 0
+        boss_last_shot = now
+        waiting_for_next_wave = False
+        wave_break_end = 0
+        pending_boss_level_up = False
+        house_entered_this_break = False
+        house_message = ""
+        in_house = False
+        reloading = False
+        reload_end = 0
+        prepare_wave_ammo()
+
+        next_theme = map_theme_for_wave(wave)
+        set_status_message(f"Cheat activated: {next_theme['name']} unlocked", 3200)
+
+    def check_cheat_key(event):
+        nonlocal cheat_buffer
+        if paused or in_house:
+            return
+
+        key_name = pygame.key.name(event.key).upper()
+        if len(key_name) == 1 and "A" <= key_name <= "Z":
+            key_char = key_name
+        elif event.unicode and event.unicode.isascii() and event.unicode.isalpha():
+            key_char = event.unicode.upper()
+        else:
+            return
+
+        cheat_buffer = (cheat_buffer + key_char)[-CHEAT_BUFFER_LIMIT:]
+        for code in LEVEL_SKIP_CHEATS:
+            if cheat_buffer.endswith(code):
+                cheat_buffer = ""
+                skip_level_cheat()
+                return
+
+    def submit_cheat_chat():
+        nonlocal cheat_chat_text
+        code = cheat_chat_text.strip().upper()
+        cheat_chat_text = ""
+        if not code:
+            return
+        if code in LEVEL_SKIP_CHEATS:
+            skip_level_cheat()
+        else:
+            set_status_message(f"Unknown cheat: {code}", 1800)
+
+    def draw_cheat_chat():
+        box_width = min(760, WIDTH - 80)
+        box_height = 54
+        box_x = WIDTH // 2 - box_width // 2
+        box_y = HEIGHT - 190
+        box = pygame.Surface((box_width, box_height), pygame.SRCALPHA)
+        box.fill((10, 12, 18, 225))
+        screen.blit(box, (box_x, box_y))
+        pygame.draw.rect(screen, (95, 180, 255), (box_x, box_y, box_width, box_height), 2, border_radius=8)
+        text = cheat_chat_text if cheat_chat_text else "type cheat code..."
+        color = (245, 250, 255) if cheat_chat_text else (145, 155, 170)
+        screen.blit(font.render(f"> {text}", True, color), (box_x + 18, box_y + 17))
+
+    def try_drop_medkit():
+        nonlocal medkits
+        if medkits >= MAX_MEDKITS:
+            return
+
+        if random.random() < MEDKIT_DROP_CHANCE:
+            medkits += 1
+
+    pygame.mouse.set_visible(False)
+    running = True
+
+    while running:
+        now = pygame.time.get_ticks()
+        dt = clock.tick(60)
+        if player_hurt_timer > 0:
+            player_hurt_timer -= dt
+        if reloading and now >= reload_end:
+            reloading = False
+            spare_mags -= 1
+            current_mag_ammo = magazine_size()
+            set_status_message("Reloaded", 900)
+
+        # =========================
+        # EVENTS
+        # =========================
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                stop_ambient_sound()
+                return score
+            if event.type == pygame.KEYDOWN:
+                if cheat_chat_open:
+                    if event.key == pygame.K_RETURN:
+                        submit_cheat_chat()
+                        cheat_chat_open = False
+                    elif event.key == pygame.K_ESCAPE:
+                        cheat_chat_text = ""
+                        cheat_chat_open = False
+                    elif event.key == pygame.K_BACKSPACE:
+                        cheat_chat_text = cheat_chat_text[:-1]
+                    elif len(cheat_chat_text) < 24:
+                        key_name = pygame.key.name(event.key).upper()
+                        if len(key_name) == 1 and "A" <= key_name <= "Z":
+                            cheat_chat_text += key_name
+                        elif event.unicode and event.unicode.isprintable():
+                            cheat_chat_text += event.unicode
+                    continue
+
+                if event.key == pygame.K_t and not paused:
+                    cheat_chat_open = True
+                    cheat_chat_text = ""
+                    continue
+
+                check_cheat_key(event)
+                if event.key == pygame.K_1:
+                    use_medkit()
+                elif event.key == pygame.K_r:
+                    reload_weapon()
+                elif event.key == pygame.K_ESCAPE:
+                    paused = not paused
+                elif event.key == HOUSE_ENTER_KEY and waiting_for_next_wave and player.colliderect(current_house_rect()):
+                    if not house_entered_this_break:
+                        in_house = True
+                        pygame.mouse.set_visible(False)
+                if paused:
+                    if event.key == pygame.K_UP:
+                        if selected == -1:
+                            selected = 0
+                        else:
+                            selected = (selected - 1) % 3
+                    if event.key == pygame.K_DOWN:
+                        if selected == -1:
+                            selected = 0
+                        else:
+                            selected = (selected + 1) % 3
+                    if event.key == pygame.K_RETURN:
+                        if selected >= 0:
+                            if selected == 0:
+                                paused = False
+                            elif selected == 1:
+                                settings_menu()
+                            else:
+                                running = False
+
+            if paused and event.type == pygame.MOUSEBUTTONDOWN:
+                mouse_pos = pygame.mouse.get_pos()
+                if resume_rect.collidepoint(mouse_pos):
+                    paused = False
+                elif settings_rect.collidepoint(mouse_pos):
+                    settings_menu()
+                elif exit_rect.collidepoint(mouse_pos):
+                    running = False
+
+        if in_house and waiting_for_next_wave:
+            previous_weapon = current_weapon
+            coins, current_mag_ammo, spare_mags, player_hp = house_interior(coins, current_mag_ammo, spare_mags, player_hp)
+            weapon = WEAPONS[current_weapon]
+            player_sprite = weapon["sprite"]
+            shoot_delay = weapon["delay"]
+            if current_weapon != previous_weapon:
+                current_mag_ammo = magazine_size()
+                spare_mags = BASE_SPARE_MAGAZINES
+            reloading = False
+            in_house = False
+            house_entered_this_break = True
+            house_message = "House supplies updated."
+            pygame.mouse.set_visible(False)
+
+        if not paused and not cheat_chat_open:
+            # =========================
+            # MOVE PLAYER
+                # =========================
+            keys = pygame.key.get_pressed()
+            move_dir = None
+    
+            if keys[pygame.K_w]:
+                player.y -= 6
+                move_dir = (0, -1)
+            if keys[pygame.K_s]:
+                player.y += 6
+                move_dir = (0, 1)
+            if keys[pygame.K_a]:
+                player.x -= 6
+                move_dir = (-1, 0)
+            if keys[pygame.K_d]:
+                player.x += 6
+                move_dir = (1, 0)
+    
+            is_moving = keys[pygame.K_w] or keys[pygame.K_s] or keys[pygame.K_a] or keys[pygame.K_d]
+            world_width, world_height = current_world_size()
+            player.clamp_ip(pygame.Rect(0, 0, world_width, world_height))
+    
+            # =========================
+            # SHOOT
+            # =========================
+            shoot_dir = None
+            if keys[pygame.K_UP]:
+                shoot_dir = (0, -1)
+            elif keys[pygame.K_DOWN]:
+                shoot_dir = (0, 1)
+            elif keys[pygame.K_LEFT]:
+                shoot_dir = (-1, 0)
+            elif keys[pygame.K_RIGHT]:
+                shoot_dir = (1, 0)
+    
+            if shoot_dir:
+                look_dir = shoot_dir
+            elif move_dir:
+                look_dir = move_dir
+    
+            if shoot_dir and current_mag_ammo > 0 and not reloading and now - last_shot > shoot_delay:
+                bullets.extend(make_player_bullets(shoot_dir))
+                current_mag_ammo -= 1
+                last_shot = now
+            elif shoot_dir and current_mag_ammo <= 0 and spare_mags > 0 and not reloading:
+                reload_weapon()
+    
+            # =========================
+            # MOVE BULLETS
+            # =========================
+            for b in bullets:
+                b["rect"].x += b["vx"]
+                b["rect"].y += b["vy"]
+    
+            bullets = [
+                b for b in bullets
+                if 0 < b["rect"].x < world_width
+                and 0 < b["rect"].y < world_height
+            ]
+    
+            # =========================
+            # SPAWN ENEMIES
+            # =========================
+            if boss is None and not waiting_for_next_wave:
+                mini_boss_target = mini_boss_count_for_wave()
+                while mini_bosses_spawned < mini_boss_target:
+                    mini_bosses.append(spawn_mini_boss())
+                    mini_bosses_spawned += 1
+
+                if spawned < enemy_count:
+                    if random.randint(1, spawn_rate) == 1:
+                        enemies.append(spawn_enemy())
+                        spawned += 1
+
+            # =========================
+            # MOVE ENEMIES
+            # =========================
+            for e in enemies:
+                zombie = e["rect"]
+                dx = player.x - zombie.x
+                dy = player.y - zombie.y
+                dist = math.hypot(dx, dy)
+    
+                if dist != 0:
+                    zombie.x += int(dx / dist * enemy_speed * e["type"]["speed_mult"])
+                    zombie.y += int(dy / dist * enemy_speed * e["type"]["speed_mult"])
+
+                if "shoot_delay" in e["type"] and now - e["last_shot"] > e["type"]["shoot_delay"] and 0 < dist <= e["type"]["range"]:
+                    vx = dx / dist
+                    vy = dy / dist
+                    enemy_bullets.append({
+                        "rect": pygame.Rect(zombie.centerx - 5, zombie.centery - 5, 10, 10),
+                        "vx": vx * 8,
+                        "vy": vy * 8,
+                        "damage": 8,
+                    })
+                    e["last_shot"] = now
+    
+            for mb in mini_bosses:
+                mini_boss = mb["rect"]
+                dx = player.x - mini_boss.x
+                dy = player.y - mini_boss.y
+                dist = math.hypot(dx, dy)
+    
+                if dist != 0:
+                    mini_boss.x += int(dx / dist * enemy_speed * 0.65)
+                    mini_boss.y += int(dy / dist * enemy_speed * 0.65)
+    
+                if now - mb["last_shot"] > MINI_BOSS_SHOOT_DELAY and 0 < dist <= MINI_BOSS_SIGHT_RANGE:
+                    vx = dx / dist
+                    vy = dy / dist
+                    mini_boss_bullets.append({
+                        "rect": pygame.Rect(mini_boss.centerx - 5, mini_boss.centery - 5, 10, 10),
+                        "vx": vx * 10,
+                        "vy": vy * 10,
+                    })
+                    mb["last_shot"] = now
+    
+            # =========================
+            # BULLET HIT ENEMIES (SAFE REMOVE)
+            # =========================
+            new_bullets = []
+    
+            for b in bullets:
+                hit = False
+                blast_center = bullet_center(b)
+                hit_enemies = [
+                    e for e in enemies
+                    if b["rect"].colliderect(e["rect"]) or in_blast_radius(e["rect"], blast_center, b["blast_radius"])
+                ]
+                hit_mini_bosses = [
+                    mb for mb in mini_bosses
+                    if b["rect"].colliderect(mb["rect"]) or in_blast_radius(mb["rect"], blast_center, b["blast_radius"])
+                ]
+    
+                for e in hit_enemies:
+                    e["hp"] -= b["damage"]
+                    add_floating_text(f"-{b['damage']}", e["rect"].center, (255, 235, 160))
+                    add_particles(e["rect"].center, e["type"]["bar"], 3)
+                    if e["hp"] <= 0 and e in enemies:
+                        drop_enemy_loot(e)
+                        add_particles(e["rect"].center, (110, 25, 25), 12)
+                        enemies.remove(e)
+                        score += 1
+                        coins += e["type"]["reward"]
+                        add_floating_text(f"+{e['type']['reward']}", e["rect"].center, (255, 215, 90))
+                    hit = True
+    
+                for mb in hit_mini_bosses:
+                    mb["hp"] -= b["damage"]
+                    add_floating_text(f"-{b['damage']}", mb["rect"].center, (255, 235, 160))
+                    add_particles(mb["rect"].center, (230, 170, 60), 4)
+                    if mb["hp"] <= 0 and mb in mini_bosses:
+                        add_particles(mb["rect"].center, (180, 70, 30), 18)
+                        mini_bosses.remove(mb)
+                        score += 5
+                        coins += MINI_BOSS_COIN_REWARD
+                        add_floating_text(f"+{MINI_BOSS_COIN_REWARD}", mb["rect"].center, (255, 215, 90))
+                    hit = True
+    
+                if not hit:
+                    new_bullets.append(b)
+    
+            bullets = new_bullets
+    
+            # =========================
+            # BOSS SHOOT
+            # =========================
+            if boss:
+                if now - boss_last_shot > boss_shoot_delay:
+    
+                    dx = player.centerx - boss.centerx
+                    dy = player.centery - boss.centery
+                    dist = math.hypot(dx, dy)
+    
+                    if 0 < dist <= BOSS_SIGHT_RANGE:
+                        vx = dx / dist
+                        vy = dy / dist
+    
+                        boss_bullets.append({
+                            "rect": pygame.Rect(boss.centerx, boss.centery, 10, 10),
+                            "vx": vx * 7,
+                            "vy": vy * 7
+                        })
+    
+                    boss_last_shot = now
+    
+            # =========================
+            # MOVE BOSS BULLETS
+            # =========================
+            for b in boss_bullets:
+                b["rect"].x += b["vx"]
+                b["rect"].y += b["vy"]
+    
+            boss_bullets = [
+                b for b in boss_bullets
+                if 0 < b["rect"].x < world_width
+                and 0 < b["rect"].y < world_height
+            ]
+    
+            # =========================
+            # MOVE MINI BOSS BULLETS
+            # =========================
+            for b in mini_boss_bullets:
+                b["rect"].x += b["vx"]
+                b["rect"].y += b["vy"]
+    
+            mini_boss_bullets = [
+                b for b in mini_boss_bullets
+                if 0 < b["rect"].x < world_width
+                and 0 < b["rect"].y < world_height
+            ]
+
+            for b in enemy_bullets:
+                b["rect"].x += b["vx"]
+                b["rect"].y += b["vy"]
+
+            enemy_bullets = [
+                b for b in enemy_bullets
+                if 0 < b["rect"].x < world_width
+                and 0 < b["rect"].y < world_height
+            ]
+    
+            # =========================
+            # PLAYER HIT
+            # =========================
+            new_boss_bullets = []
+            for b in boss_bullets:
+                if player.colliderect(b["rect"]):
+                    if hurt_player(BOSS_BULLET_DAMAGE):
+                        stop_ambient_sound()
+                        game_over_screen(score)
+                        return score
+                else:
+                    new_boss_bullets.append(b)
+    
+            boss_bullets = new_boss_bullets
+    
+            new_mini_boss_bullets = []
+            for b in mini_boss_bullets:
+                if player.colliderect(b["rect"]):
+                    if hurt_player(MINI_BOSS_BULLET_DAMAGE):
+                        stop_ambient_sound()
+                        game_over_screen(score)
+                        return score
+                else:
+                    new_mini_boss_bullets.append(b)
+    
+            mini_boss_bullets = new_mini_boss_bullets
+
+            new_enemy_bullets = []
+            for b in enemy_bullets:
+                if player.colliderect(b["rect"]):
+                    if hurt_player(b["damage"]):
+                        stop_ambient_sound()
+                        game_over_screen(score)
+                        return score
+                else:
+                    new_enemy_bullets.append(b)
+
+            enemy_bullets = new_enemy_bullets
+    
+            for e in enemies:
+                if player.colliderect(e["rect"]):
+                    if hurt_player(e["type"]["damage"]):
+                        stop_ambient_sound()
+                        game_over_screen(score)
+                        return score
+    
+            for mb in mini_bosses:
+                if player.colliderect(mb["rect"]):
+                    if hurt_player(MINI_BOSS_TOUCH_DAMAGE):
+                        stop_ambient_sound()
+                        game_over_screen(score)
+                        return score
+
+            remaining_ammo_pickups = []
+            for pickup in ammo_pickups:
+                if player.colliderect(pickup["rect"]):
+                    if current_mag_ammo < magazine_size():
+                        current_mag_ammo = magazine_size()
+                    else:
+                        spare_mags = min(MAX_SPARE_MAGAZINES, spare_mags + 1)
+                    add_floating_text("+Ammo", player.center, (180, 220, 255))
+                else:
+                    remaining_ammo_pickups.append(pickup)
+            ammo_pickups = remaining_ammo_pickups
+
+            remaining_medkit_pickups = []
+            for pickup in medkit_pickups:
+                if player.colliderect(pickup["rect"]):
+                    if medkits < MAX_MEDKITS:
+                        medkits += 1
+                        add_floating_text("+Medkit", player.center, (120, 255, 140))
+                    else:
+                        remaining_medkit_pickups.append(pickup)
+                else:
+                    remaining_medkit_pickups.append(pickup)
+            medkit_pickups = remaining_medkit_pickups
+    
+            if boss and player.colliderect(boss):
+                if hurt_player(BOSS_TOUCH_DAMAGE):
+                    stop_ambient_sound()
+                game_over_screen(score)
+                return score
+
+        # =========================
+        # BOSS DAMAGE (FIXED)
+        # =========================
+        if boss:
+            new_bullets = []
+
+            for b in bullets:
+                if b["rect"].colliderect(boss):
+                    boss_hp -= b["damage"]
+                    add_floating_text(f"-{b['damage']}", boss.center, (255, 235, 160))
+                    add_particles(boss.center, (255, 80, 80), 5)
+                elif in_blast_radius(boss, bullet_center(b), b["blast_radius"]):
+                    boss_hp -= b["damage"]
+                    add_floating_text(f"-{b['damage']}", boss.center, (255, 235, 160))
+                    add_particles(boss.center, (255, 120, 80), 8)
+                else:
+                    new_bullets.append(b)
+
+            bullets = new_bullets
+
+        # =========================
+        # WAVE SYSTEM
+        # =========================
+        if len(enemies) == 0 and len(mini_bosses) == 0 and boss is None and spawned >= enemy_count:
+                if not waiting_for_next_wave:
+                    try_drop_medkit()
+                    coins += wave_clear_reward()
+                    prepare_wave_ammo()
+                    waiting_for_next_wave = True
+                    wave_break_end = now + BREAK_DURATION
+                    house_entered_this_break = False
+                    house_message = "House open! Enter to rest."
+                    set_status_message(f"Wave clear! +{wave_clear_reward()} coins", 3000)
+
+                if waiting_for_next_wave and now >= wave_break_end:
+                    waiting_for_next_wave = False
+                    previous_map_index = map_index_for_wave(wave)
+                    wave += 1
+                    if map_index_for_wave(wave) != previous_map_index:
+                        move_player_to_current_map_center()
+                        bullets.clear()
+                        boss_bullets.clear()
+                        mini_boss_bullets.clear()
+                        enemy_bullets.clear()
+                    spawned = 0
+                    mini_bosses_spawned = 0
+                    enemy_count = wave_size(wave)
+                    enemy_speed = wave_config(wave)["speed"]
+                    spawn_rate = wave_config(wave)["spawn_rate"]
+                    theme = map_theme_for_wave(wave)
+                    set_status_message(f"{theme['name']} - Wave {wave_in_map(wave)}/{WAVES_PER_MAP} started", 2500)
+
+                    if wave_config(wave).get("boss"):
+                        boss = spawn_boss()
+                        boss_max_hp = 70 * level if wave_config(wave).get("final") else 20 * level
+                        boss_hp = boss_max_hp
+                        prepare_wave_ammo()
+                    elif pending_boss_level_up:
+                        pending_boss_level_up = False
+                        prepare_wave_ammo()
+                    else:
+                        prepare_wave_ammo()
+        # =========================
+        # BOSS DEATH
+        # =========================
+        if boss and boss_hp <= 0:
+            boss_center = boss.center
+            boss = None
+            level += 1
+            score += 25
+            coins += BOSS_COIN_REWARD
+            add_floating_text(f"+{BOSS_COIN_REWARD}", boss_center, (255, 215, 90))
+            if wave >= FINAL_WAVE:
+                add_particles(boss_center, (180, 255, 190), 28)
+                stop_ambient_sound()
+                victory_screen(score)
+                return score
+            if not waiting_for_next_wave:
+                pending_boss_level_up = True
+                coins += wave_clear_reward()
+                prepare_wave_ammo()
+                waiting_for_next_wave = True
+                wave_break_end = now + BREAK_DURATION
+                house_entered_this_break = False
+                if wave_in_map(wave) == WAVES_PER_MAP:
+                    next_theme = map_theme_for_wave(wave + 1)
+                    house_message = f"Next map unlocked: {next_theme['name']}."
+                else:
+                    house_message = "House open! Enter to rest."
+
+        for text in floating_texts:
+            text["y"] -= dt * 0.045
+        floating_texts = [text for text in floating_texts if now < text["until"]]
+        for particle in particles:
+            particle["x"] += particle["vx"]
+            particle["y"] += particle["vy"]
+            particle["vy"] += 0.06
+        particles = [particle for particle in particles if now < particle["until"]]
+
+        # =========================
+        # DRAW
+        # =========================
+        camera_x, camera_y = get_camera()
+        current_theme = map_theme_for_wave(wave)
+        screen.blit(current_theme["surface"], (-camera_x, -camera_y))
+        if waiting_for_next_wave:
+            house_screen_rect = camera_rect(current_house_rect(), camera_x, camera_y)
+            pygame.draw.rect(screen, (255, 255, 255), house_screen_rect, 3)
+        draw_player_character(player, camera_x, camera_y, is_moving, look_dir, current_weapon, player_sprite, hurt=player_hurt_timer > 0)
+
+        for e in enemies:
+            zombie = e["rect"]
+            zombie_screen = camera_rect(zombie, camera_x, camera_y)
+            screen.blit(e["sprite"], zombie_screen)
+            hp_ratio = max(e["hp"], 0) / e["max_hp"]
+            pygame.draw.rect(screen, (40, 40, 40), (zombie_screen.x, zombie_screen.y - 8, zombie.width, 5))
+            pygame.draw.rect(screen, e["type"]["bar"], (zombie_screen.x, zombie_screen.y - 8, zombie.width * hp_ratio, 5))
+
+        for mb in mini_bosses:
+            mini_boss = mb["rect"]
+            mini_boss_screen = camera_rect(mini_boss, camera_x, camera_y)
+            screen.blit(enemy_p_img, mini_boss_screen)
+            hp_ratio = max(mb["hp"], 0) / mb["max_hp"]
+            pygame.draw.rect(screen, (40, 40, 40), (mini_boss_screen.x, mini_boss_screen.y - 10, 70, 6))
+            pygame.draw.rect(screen, (230, 170, 60), (mini_boss_screen.x, mini_boss_screen.y - 10, 70 * hp_ratio, 6))
+
+        if boss:
+            boss_screen = camera_rect(boss, camera_x, camera_y)
+            screen.blit(boss_img, boss_screen)
+
+            hp_ratio = boss_hp / boss_max_hp
+            pygame.draw.rect(screen, (255, 255, 255), (boss_screen.x, boss_screen.y - 20, 220, 10))
+            pygame.draw.rect(screen, (255, 0, 0), (boss_screen.x, boss_screen.y - 20, 220 * hp_ratio, 10))
+
+        for b in bullets:
+            screen.blit(bullet_img, camera_rect(b["rect"], camera_x, camera_y))
+
+        for b in boss_bullets:
+            pygame.draw.rect(screen, current_theme["boss_bullet_color"], camera_rect(b["rect"], camera_x, camera_y))
+
+        for b in mini_boss_bullets:
+            pygame.draw.rect(screen, current_theme["mini_boss_bullet_color"], camera_rect(b["rect"], camera_x, camera_y))
+
+        for b in enemy_bullets:
+            pygame.draw.rect(screen, current_theme["enemy_bullet_color"], camera_rect(b["rect"], camera_x, camera_y))
+
+        for pickup in ammo_pickups:
+            pickup_rect = camera_rect(pickup["rect"], camera_x, camera_y)
+            pygame.draw.rect(screen, (60, 110, 170), pickup_rect, border_radius=4)
+            pygame.draw.rect(screen, (190, 230, 255), pickup_rect, 2, border_radius=4)
+
+        for pickup in medkit_pickups:
+            pickup_rect = camera_rect(pickup["rect"], camera_x, camera_y)
+            pygame.draw.rect(screen, (40, 130, 70), pickup_rect, border_radius=4)
+            pygame.draw.line(screen, (220, 255, 220), pickup_rect.midleft, pickup_rect.midright, 3)
+            pygame.draw.line(screen, (220, 255, 220), pickup_rect.midtop, pickup_rect.midbottom, 3)
+
+        for particle in particles:
+            pygame.draw.circle(
+                screen,
+                particle["color"],
+                (int(particle["x"] - camera_x), int(particle["y"] - camera_y)),
+                particle["radius"],
+            )
+
+        for text in floating_texts:
+            text_surface = font.render(text["text"], True, text["color"])
+            screen.blit(text_surface, (text["x"] - camera_x, text["y"] - camera_y))
+
+        # =========================
+        # UI
+        # =========================
+        elapsed_seconds = (now - start_time) // 1000
+        elapsed_minutes = elapsed_seconds // 60
+        elapsed_seconds = elapsed_seconds % 60
+        zombie_count = len(enemies) + len(mini_bosses)
+
+        screen.blit(font.render(f"Map: {current_theme['name']} ({map_index_for_wave(wave) + 1}/{len(MAP_THEMES)})", True, (0,255,200)), (20, 20))
+        screen.blit(font.render(f"Wave: {wave_in_map(wave)}/{WAVES_PER_MAP}  Total: {wave}/{FINAL_WAVE}", True, (0,255,200)), (20, 60))
+        screen.blit(font.render(f"Zombies left: {zombie_count}", True, (255,200,0)), (20, 100))
+        screen.blit(font.render(f"Pos: ({player.x}, {player.y})", True, (220,220,220)), (20, 140))
+
+        screen_rect = screen.get_rect()
+        panel_width = min(820, screen_rect.width - 40)
+        panel_height = 112
+        panel_x = screen_rect.centerx - panel_width // 2
+        panel_y = screen_rect.bottom - panel_height
+        panel = pygame.Surface((panel_width, panel_height), pygame.SRCALPHA)
+        panel.fill((18, 20, 24, 210))
+        screen.blit(panel, (panel_x, panel_y))
+        pygame.draw.rect(screen, (95, 105, 120), (panel_x, panel_y, panel_width, panel_height), 2, border_radius=8)
+
+        hp_ratio = max(player_hp, 0) / PLAYER_MAX_HP
+        hp_bar = pygame.Rect(panel_x + 24, panel_y + 58, 210, 18)
+        pygame.draw.rect(screen, (55, 20, 24), hp_bar, border_radius=5)
+        pygame.draw.rect(screen, (220, 65, 70), (hp_bar.x, hp_bar.y, int(hp_bar.width * hp_ratio), hp_bar.height), border_radius=5)
+
+        hp_text = font.render(f"{max(player_hp, 0)}/{PLAYER_MAX_HP}", True, (255,245,245))
+        screen.blit(hp_text, (hp_bar.centerx - hp_text.get_width() // 2, hp_bar.centery - hp_text.get_height() // 2))
+        ammo_label = "Reloading" if reloading else f"Ammo {current_mag_ammo}/{magazine_size()}"
+        screen.blit(font.render(ammo_label, True, (180,220,255)), (panel_x + 270, panel_y + 18))
+        screen.blit(font.render(f"Mags {spare_mags}/{MAX_SPARE_MAGAZINES}", True, (190,235,205)), (panel_x + 270, panel_y + 58))
+        screen.blit(font.render(f"Coins {coins}", True, (255,215,90)), (panel_x + 500, panel_y + 18))
+        screen.blit(font.render(f"Medkits {medkits}/{MAX_MEDKITS}", True, (120,255,140)), (panel_x + 500, panel_y + 58))
+        screen.blit(font.render(f"{weapon_display_name(current_weapon)}  Lv {level}  {elapsed_minutes:02d}:{elapsed_seconds:02d}", True, (235,235,235)), (panel_x + 24, panel_y + 82))
+
+        if reloading:
+            reload_ratio = 1 - max(0, reload_end - now) / weapon_reload_time(current_weapon)
+            reload_bar = pygame.Rect(panel_x + 270, panel_y + 50, 190, 8)
+            pygame.draw.rect(screen, (35, 45, 55), reload_bar, border_radius=4)
+            pygame.draw.rect(screen, (110, 190, 255), (reload_bar.x, reload_bar.y, int(reload_bar.width * reload_ratio), reload_bar.height), border_radius=4)
+        elif current_mag_ammo <= 0 and not waiting_for_next_wave:
+            reload_hint = "Press [R] to reload" if spare_mags > 0 else "Out of ammo! Buy ammo in the house."
+            screen.blit(font.render(reload_hint, True, (255,120,120)), (panel_x + 270, panel_y - 42))
+        if now < status_message_until:
+            status_surface = font.render(status_message, True, (255, 245, 190))
+            screen.blit(status_surface, (screen_rect.centerx - status_surface.get_width() // 2, 170))
+        if waiting_for_next_wave:
+            remaining = max(0, (wave_break_end - now) // 1000)
+            screen.blit(font.render(f"House is open! Enter [E] ({remaining}s)", True, (255,255,180)), (20, 180))
+            if player.colliderect(current_house_rect()):
+                screen.blit(font.render("Press [E] to enter house", True, (180,255,255)), (20, 220))
+            if house_message:
+                screen.blit(font.render(house_message, True, (180,255,180)), (20, 260))
+
+        if cheat_chat_open:
+            draw_cheat_chat()
+
+        if paused:
+            draw_pause_menu()
+        else:
+            pygame.mouse.set_visible(False)
+
+        pygame.display.flip()
+
+# =========================
+# START
+# =========================
+if __name__ == "__main__":
+    save_data = load_save_data()
+    best_score = int(save_data.get("best_score", 0))
+    last_score = 0
+    saved_weapons = save_data.get("unlocked_weapons", [])
+    unlocked_weapons.update(weapon for weapon in saved_weapons if weapon in WEAPONS)
+    saved_weapon = save_data.get("current_weapon")
+    if saved_weapon in unlocked_weapons:
+        current_weapon = saved_weapon
+    MAX_MEDKITS = max(3, min(MAX_MEDKIT_CAPACITY, int(save_data.get("max_medkits", MAX_MEDKITS))))
+    saved_upgrades = save_data.get("weapon_upgrades", {})
+    for weapon_key, upgrades in saved_upgrades.items():
+        if weapon_key in weapon_upgrades and isinstance(upgrades, dict):
+            for upgrade_key in weapon_upgrades[weapon_key]:
+                weapon_upgrades[weapon_key][upgrade_key] = max(
+                    0,
+                    min(MAX_WEAPON_UPGRADE_LEVEL, int(upgrades.get(upgrade_key, 0)))
+                )
+    saved_settings = save_data.get("settings", {})
+    if isinstance(saved_settings, dict):
+        SETTINGS["music_volume"] = max(0, min(1, float(saved_settings.get("music_volume", SETTINGS["music_volume"]))))
+        SETTINGS["sfx_volume"] = max(0, min(1, float(saved_settings.get("sfx_volume", SETTINGS["sfx_volume"]))))
+        SETTINGS["fullscreen"] = bool(saved_settings.get("fullscreen", SETTINGS["fullscreen"]))
+        saved_language = saved_settings.get("language", SETTINGS["language"])
+        if saved_language in LANGUAGES:
+            SETTINGS["language"] = saved_language
+        if not SETTINGS["fullscreen"]:
+            screen = pygame.display.set_mode((WIDTH, HEIGHT))
+
+    while True:
+        stop_ambient_sound()
+        if not menu(best_score, last_score):
+            save_progress(best_score)
+            break
+
+        score = game()
+        if score is None:
+            score = 0
+
+        last_score = score
+        if score > best_score:
+            best_score = score
+        save_progress(best_score)
+
+    pygame.quit()

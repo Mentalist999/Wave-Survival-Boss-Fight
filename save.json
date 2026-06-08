@@ -1,0 +1,45 @@
+{
+  "best_score": 675,
+  "unlocked_weapons": [
+    "pistol",
+    "rifle",
+    "rpg",
+    "shotgun",
+    "sniper"
+  ],
+  "current_weapon": "rifle",
+  "max_medkits": 6,
+  "weapon_upgrades": {
+    "pistol": {
+      "damage": 0,
+      "magazine": 0,
+      "reload": 0
+    },
+    "shotgun": {
+      "damage": 0,
+      "magazine": 0,
+      "reload": 0
+    },
+    "rifle": {
+      "damage": 3,
+      "magazine": 3,
+      "reload": 3
+    },
+    "sniper": {
+      "damage": 0,
+      "magazine": 0,
+      "reload": 0
+    },
+    "rpg": {
+      "damage": 3,
+      "magazine": 3,
+      "reload": 1
+    }
+  },
+  "settings": {
+    "music_volume": 1,
+    "sfx_volume": 1,
+    "fullscreen": true,
+    "language": "ru"
+  }
+}
